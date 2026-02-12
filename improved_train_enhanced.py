@@ -99,9 +99,10 @@ class MetricsTracker:
         if len(y_true) == 0:
             return
         
-        y_true = np.array(y_true)
-        y_pred_probs = np.array(y_pred_probs)
-        y_pred_binary = np.array(y_pred_binary)
+        # Convert lists of arrays to single arrays (handle variable batch sizes)
+        y_true = np.vstack(y_true) if isinstance(y_true[0], np.ndarray) else np.array(y_true)
+        y_pred_probs = np.vstack(y_pred_probs) if isinstance(y_pred_probs[0], np.ndarray) else np.array(y_pred_probs)
+        y_pred_binary = np.vstack(y_pred_binary) if isinstance(y_pred_binary[0], np.ndarray) else np.array(y_pred_binary)
         
         # Metrics
         precision_mac, recall_mac, f1_mac, _ = precision_recall_fscore_support(
