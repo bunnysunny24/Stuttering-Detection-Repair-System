@@ -27,6 +27,7 @@ from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 from datetime import datetime
 import pickle
+from tqdm import tqdm
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix, roc_auc_score
 import warnings
 warnings.filterwarnings('ignore')
@@ -268,7 +269,10 @@ class Trainer:
         y_pred_probs_all = []
         y_pred_binary_all = []
         
-        for batch_idx, (X, y) in enumerate(self.train_loader):
+        # Progress bar for training
+        pbar = tqdm(self.train_loader, desc=f"EPOCH {epoch+1}/30 [TRAIN]", ncols=80)
+        
+        for batch_idx, (X, y) in enumerate(pbar):
             X = X.to(self.device)
             y = y.to(self.device)
             
@@ -295,9 +299,10 @@ class Trainer:
                 y_pred_binary_all.append((probs > 0.5).numpy())
                 y_true_all.append(y.cpu().numpy())
             
-            if (batch_idx + 1) % 50 == 0:
-                print(f"  Batch {batch_idx + 1}/{len(self.train_loader)}, Loss: {loss.item():.4f}")
+            # Update progress bar with current loss
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
+        pbar.close()
         avg_loss = total_loss / len(self.train_loader)
         
         self.metrics.record(
@@ -321,8 +326,11 @@ class Trainer:
         y_pred_probs_all = []
         y_pred_binary_all = []
         
+        # Progress bar for validation
+        pbar = tqdm(self.val_loader, desc=f"EPOCH {epoch+1}/30 [VAL] ", ncols=80)
+        
         with torch.no_grad():
-            for X, y in self.val_loader:
+            for X, y in pbar:
                 X = X.to(self.device)
                 y = y.to(self.device)
                 
@@ -335,7 +343,11 @@ class Trainer:
                 y_pred_probs_all.append(probs.numpy())
                 y_pred_binary_all.append((probs > 0.5).numpy())
                 y_true_all.append(y.cpu().numpy())
+                
+                # Update progress bar with current loss
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
         
+        pbar.close()
         avg_loss = total_loss / len(self.val_loader)
         
         self.metrics.record(
