@@ -6,12 +6,134 @@ Complete end-to-end pipeline for training detection models, detecting stuttering
 
 ---
 
+## ⚙️ ENVIRONMENT SETUP (First Time Only!)
+
+### Option 1: Quick Activation (If Environment Exists)
+
+```powershell
+# If you have .venv_models folder already:
+cd d:\Bunny\AGNI
+.venv_models\Scripts\Activate.ps1
+# Done! You'll see (.venv_models) prefix in terminal
+```
+
+### Option 2: Complete Fresh Setup (No Environment Yet)
+
+**Step 1: Create Virtual Environment**
+```powershell
+# Navigate to project
+cd d:\Bunny\AGNI
+
+# Create isolated Python environment
+# This creates .venv_models folder (takes 2-3 minutes)
+python -m venv .venv_models
+
+# Verify it was created
+Get-ChildItem .venv_models
+# Should show: Lib, Scripts, pyvenv.cfg
+```
+
+**Step 2: Activate Environment** 
+```powershell
+# Activate it (do this EVERY time you open terminal)
+.venv_models\Scripts\Activate.ps1
+
+# You should see: (.venv_models) PS D:\Bunny\AGNI>
+# The (.venv_models) prefix means environment is active
+
+# If activation fails with "scripts disabled" error:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+# Then try activating again
+.venv_models\Scripts\Activate.ps1
+```
+
+**Step 3: Upgrade pip**
+```powershell
+# Update pip to latest version (important!)
+python -m pip install --upgrade pip
+
+# Output: Successfully installed pip-24.x.x
+```
+
+**Step 4: Install PyTorch (Choose Your Hardware)**
+
+🎯 **YOUR SETUP (Intel ThinkPad T14 - CPU Recommended):**
+```powershell
+# Fast, simple, and FASTER than your Iris Xe GPU
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+*Alternative: If you have NVIDIA GPU:*
+```powershell
+# For RTX 3000/4000 series (CUDA 11.8):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# For RTX 4090/5000 series (CUDA 12.1 - Latest):
+pip install torch torchvision torchaudio
+```
+
+*Alternative: If you have AMD GPU:*
+```powershell
+# For AMD Radeon RX 6000/7000 (ROCm 5.7):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+```
+
+**Step 5: Install All Dependencies**
+```powershell
+# Install everything from requirements file
+pip install -r requirements_complete.txt
+
+# This installs 25+ packages (takes 2-5 minutes):
+# - librosa, soundfile, openai-whisper
+# - numpy, pandas, scipy, scikit-learn
+# - matplotlib, tqdm, peft, accelerate
+# - And more...
+
+# Output ends with: Successfully installed [packages]
+```
+
+**Step 6: Verify Everything**
+```powershell
+# Quick sanity check
+python -c "import torch; import librosa; import whisper; print('✅ Ready to train!')"
+
+# Detailed verification
+python -c "
+import torch
+import librosa
+import soundfile
+import whisper
+import numpy
+print('═' * 50)
+print('✅ ENVIRONMENT FULLY CONFIGURED')
+print('═' * 50)
+print(f'PyTorch: {torch.__version__}')
+print(f'NumPy: {numpy.__version__}')
+print(f'Device: {\"GPU (CUDA)\" if torch.cuda.is_available() else \"CPU\"}')
+print('═' * 50)
+"
+```
+
+**Expected output:**
+```
+==================================================
+✅ ENVIRONMENT FULLY CONFIGURED
+==================================================
+PyTorch: 2.0.1+cpu or 2.0.1+cu118 (depends on GPU)
+NumPy: 1.24.x
+Device: CPU or GPU (CUDA)
+==================================================
+```
+
+---
+
 ## 🚀 QUICK START - COPY & PASTE (4 Steps)
 
-### Step 0: Activate Environment (Do This First!)
+### Step 0: Activate Environment (Every Session!)
 ```powershell
 cd d:\Bunny\AGNI
 .venv_models\Scripts\Activate.ps1
+# Look for (.venv_models) prefix in terminal before proceeding
 ```
 
 ### Step 1: Train Model - IMPROVED HYPERPARAMETERS (Total: ~17 hours for 30 epochs)
