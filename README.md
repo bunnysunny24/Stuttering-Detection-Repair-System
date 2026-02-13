@@ -346,6 +346,20 @@ Timeline: ~17 hours with batch-96 (35 min/epoch)
 
 ---
 
+**0. preprocess_data.py** (DATA PREPROCESSING - Run Once Before Training!)
+- Purpose: Extract Log-Mel spectrograms from raw audio files
+- When: **ONE-TIME ONLY** before your first training (then skip)
+- Features: Automatic train/val split (80/20), batch processing, progress bar
+- Command: `python Models/preprocess_data.py`
+- Output: 
+  - `datasets/features/train/` (~24k spectrogram files)
+  - `datasets/features/val/` (~6k spectrogram files)
+- Time: **~2 minutes** on i7-1165G7
+- Size: 2.5 GB total features on disk
+- Check if needed: If `datasets/features/train/` has files, skip preprocessing!
+- Details: Creates 80×256 Mel-spectrograms (2.56s windows) from 16kHz audio
+- Reuse: After preprocessing once, use extracted features for all training runs
+
 **1. improved_train_enhanced.py** (TRAINING - Run First)
 - Purpose: Train the stuttering detection model
 - When: Only once at the beginning
@@ -384,9 +398,20 @@ Timeline: ~17 hours with batch-96 (35 min/epoch)
 - Time: 30-60 seconds per file (includes Whisper ASR)
 - Tested: ✅ Works correctly, creates repaired audio + repair report
 
-### 🔧 SUPPORT SCRIPTS (8 Total - All Required)
+### 🔧 MAIN SCRIPTS & SUPPORT SCRIPTS
 
-Required for the 3 main scripts to work:
+#### ⭐ MAIN / PRIMARY SCRIPTS (Required & Use These)
+
+| Script | Used For | Purpose | Size |
+|--------|----------|---------|------|
+| **preprocess_data.py** | **Data Prep** | **Extract spectrograms from audio (RUN FIRST!)** | **4.2 KB** |
+| improved_train_enhanced.py | Training | Train the stuttering detection model | 12.4 KB |
+| predict_enhanced.py | Testing | Detect stuttering on audio files | 8.9 KB |
+| run_asr_map_repair.py | Repair | Full pipeline: detect → transcribe → repair audio | 14.7 KB |
+
+#### 🔧 SUPPORT SCRIPTS (Required by the main scripts)
+
+Required for the main scripts to work:
 
 | Script | Used By | Purpose | Size |
 |--------|---------|---------|------|
@@ -452,12 +477,158 @@ FINAL OUTPUT
 
 ---
 
+## 📥 DATA PREPROCESSING
+
+### What Does Preprocessing Do?
+
+Preprocessing extracts **Log-Mel spectrograms** from raw audio files, converting them into numerical features that the neural network can learn from. This is a required one-time step before training.
+
+**Input:** Raw audio files (16 kHz WAV format) from `datasets/clips/stuttering-clips/clips/`
+**Output:** Extracted features in `datasets/features/train/` and `datasets/features/val/`
+
+### When to Preprocess?
+
+- ✅ **First time ever** - Before training the model for the first time
+- ✅ **After getting new data** - If you add new audio clips
+- ✅ **After format changes** - If audio sample rate changes
+- ❌ **Not needed** - If you already have `datasets/features/` folder with pre-extracted features
+
+### Step-by-Step Preprocessing
+
+**Quick Check - Do you need to preprocess?**
+
+```powershell
+# If this folder exists with files, preprocessing already done:
+Get-ChildItem "datasets/features/train/" -ErrorAction SilentlyContinue | Measure-Object
+
+# If result shows Count > 100, you're good! Skip preprocessing.
+# If folder empty or doesn't exist, run preprocessing.
+```
+
+**Run Preprocessing:**
+
+```powershell
+# 1. Activate environment first
+cd d:\Bunny\AGNI
+.venv_models\Scripts\Activate.ps1
+
+# 2. Run preprocessing (one-time, ~2 minutes)
+python Models/preprocess_data.py
+
+# Output during processing:
+# ✓ Loading audio files from datasets/clips/
+# ✓ Extracting Log-Mel spectrograms
+# ✓ Splitting into train/val (80/20)
+# ✓ Saving features to datasets/features/train/
+# ✓ Saving features to datasets/features/val/
+# ✓ Done! Total: 24,142 training samples, 6,035 validation samples
+```
+
+### What Gets Created?
+
+After preprocessing, you'll have:
+
+```
+datasets/features/
+├── train/
+│   ├── FluencyBank_010_0.npy (spectrogram features)
+│   ├── FluencyBank_010_1.npy
+│   ├── FluencyBank_010_2.npy
+│   └── ... (24,142 feature files)
+│
+└── val/
+    ├── FluencyBank_015_0.npy (validation set)
+    ├── FluencyBank_015_1.npy
+    └── ... (6,035 feature files)
+```
+
+**Size:** ~2.5 GB total for all extracted features (stored on disk)
+
+### Preprocessing Details
+
+The preprocessing script does the following:
+
+1. **Load Audio:** Read raw WAV files at 16 kHz sample rate
+2. **Extract Mel-Spectrogram:** 
+   - Window: 2048 samples (128ms)
+   - Hop: 512 samples (32ms)
+   - Mel filters: 80 frequency bands
+   - Result: 80 × 256 feature matrix (2.56 seconds of audio)
+3. **Apply Preprocessing:**
+   - Convert to dB scale (log compression)
+   - Normalize globally (mean=0, std=1)
+   - Handle edge cases (clip silence, pad short clips)
+4. **Split Train/Val:**
+   - 80% for training
+   - 20% for validation
+   - Random split to avoid bias
+5. **Save Features:**
+   - Each clip → one NPY file
+   - Preserves original filename (easier tracking)
+   - Ready for immediate model training
+
+### Why Preprocess First?
+
+- **Speed:** Extracting spectrograms on-the-fly during training is slow (~2x slower)
+- **Consistency:** All samples use same preprocessing (reproducible results)
+- **Memory:** Features cached on disk, only loaded during training batches
+- **Reusability:** Once extracted, can train multiple model versions without re-extracting
+
+### Full Workflow with Preprocessing
+
+```powershell
+# Step 1: Activate environment
+.venv_models\Scripts\Activate.ps1
+
+# Step 2: PREPROCESS DATA (one-time, ~2 minutes)
+python Models/preprocess_data.py
+# Wait for: "Complete! Extracted features saved."
+
+# Step 3: TRAIN MODEL (30 epochs, 1-2 hours)
+python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 64
+# Training automatically uses preprocessed features from datasets/features/
+
+# Step 4: TEST DETECTION (10 seconds)
+python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json
+
+# Step 5: REPAIR AUDIO (30-60 seconds per file)
+python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/output.wav --mode attenuate --threshold 0.3
+
+# Done! ✅
+```
+
+### Troubleshooting Preprocessing
+
+**Problem: "FileNotFoundError: datasets/clips/ not found"**
+```powershell
+# Make sure you have the audio files
+Get-ChildItem "datasets/clips/stuttering-clips/clips/" -First 5
+# Should show: FluencyBank_010_0.wav, FluencyBank_010_1.wav, etc.
+```
+
+**Problem: "Out of memory" during preprocessing**
+```powershell
+# Preprocessing is very memory-efficient, but if it fails:
+# 1. Save current work
+# 2. Restart PC
+# 3. Run: python Models/preprocess_data.py
+```
+
+**Problem: Preprocessing stuck/very slow**
+```powershell
+# Preprocessing should take ~2 minutes max
+# If not progressing after 5 minutes, press Ctrl+C and restart:
+python Models/preprocess_data.py
+```
+
+---
+
 ## 🎯 EXECUTION ORDER & TIME
 
 ### ONE-TIME SETUP (on your Lenovo ThinkPad T14 Gen 2i: i7-1165G7, 40GB RAM)
 ```
 1. Activate environment           < 1 second
-2. Preprocess data               ~2 minutes
+2. Preprocess data               ~2 minutes  ← NEW! Required before training
 3. Train model (30 epochs)       1-2 hours    ← with batch-64 or 96
 4. Done! Ready to use
 ```
@@ -472,6 +643,7 @@ FINAL OUTPUT
 ### TYPICAL WORKFLOW
 ```
 .venv_models\Scripts\Activate.ps1                              # 1 second
+python Models/preprocess_data.py                               # 2 minutes (first time only)
 python Models/improved_train_enhanced.py --epochs 30 --batch-size 64  # 1-2 HOURS
 python Models/predict_enhanced.py --model enhanced --input ...  # 10 seconds
 python Models/run_asr_map_repair.py --model_path ... --input ... # 10 seconds
@@ -525,10 +697,10 @@ d:\Bunny\AGNI\
 ├── README.md ← YOU ARE HERE
 │
 ├── Models/
+│   ├── preprocess_data.py ⭐ DATA PREPROCESSING (Run First!)
 │   ├── improved_train_enhanced.py ⭐ TRAINING
 │   ├── predict_enhanced.py ⭐ TESTING
 │   ├── run_asr_map_repair.py ⭐ REPAIR+PIPELINE
-│   ├── preprocess_data.py (data preprocessing)
 │   │
 │   ├── model_enhanced.py, model_cnn.py (REQUIRED)
 │   ├── features.py, asr_whisper.py (REQUIRED)
@@ -544,8 +716,8 @@ d:\Bunny\AGNI\
 ├── datasets/
 │   ├── clips/stuttering-clips/clips/ (30,036 processed audio files)
 │   ├── SEP-28k_labels.csv, fluencybank_labels.csv
-│   ├── features/train/ (extracted spectrograms for training)
-│   ├── features/val/ (extracted spectrograms for validation)
+│   ├── features/train/ (extracted spectrograms for training - created by preprocess_data.py)
+│   ├── features/val/ (extracted spectrograms for validation - created by preprocess_data.py)
 │   └── annotated_time_aligned/
 │
 └── output/
@@ -564,11 +736,13 @@ d:\Bunny\AGNI\
 | Operation | Batch 32 | Batch 64 | Batch 96 | Batch 128 |
 |-----------|----------|----------|----------|-----------|
 | Activate env | <1s | <1s | <1s | <1s |
-| Preprocess data | ~2 min | ~2 min | ~2 min | ~2 min |
+| **Preprocess data** | **~2 min** | **~2 min** | **~2 min** | **~2 min** |
 | Train 30 epochs | 2-3 hrs | **1-2 hrs** ⭐ | 1-1.5 hrs | 45 min - 1 hr |
 | Test 1 file | <10s | <10s | <10s | <10s |
 | Repair 1 file | 5-10s | 5-10s | 5-10s | 5-10s |
 | Batch 100 files | 8-15m | 8-15m | 8-15m | 8-15m |
+
+**Note:** Preprocessing (2 min) is ONE-TIME ONLY. After first preprocessing, training can be repeated without re-preprocessing.
 
 ---
 
@@ -701,13 +875,21 @@ python Models/preprocess_data.py
 
 ## 🎯 COMMAND REFERENCE (Copy & Paste - All Tested & Working ✅)
 
-### Setup & Training
+### Preprocessing & Setup
 ```powershell
 # 1. Activate environment (always first!)
 cd d:\Bunny\AGNI
 .venv_models\Scripts\Activate.ps1
 
-# 2. Train model (RECOMMENDED: batch 96 for fastest, batch 64 for balance)
+# 2. Preprocess data (one-time, ~2 minutes) ← DO THIS FIRST!
+python Models/preprocess_data.py
+# Extracts: datasets/features/train/ and datasets/features/val/
+# Only run ONCE unless you add new audio files
+```
+
+### Training
+```powershell
+# Train model (RECOMMENDED: batch 96 for fastest, batch 64 for balance)
 python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 96
 
 # Alternative: batch 64 (good balance - 1-2 hours)
@@ -746,16 +928,19 @@ python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_bes
 # 1. Activate environment
 .venv_models\Scripts\Activate.ps1
 
-# 2. Train model (batch 96 - ~1-1.5 hours)
+# 2. PREPROCESS DATA (one-time, ~2 minutes) ← REQUIRED FIRST!
+python Models/preprocess_data.py
+
+# 3. Train model (batch 96 - ~1-1.5 hours)
 python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 96
 
-# 3. Test detection (Epoch 1 achieves: Train F1=0.2697, Val F1=0.2527)
+# 4. Test detection (Epoch 1 achieves: Train F1=0.2697, Val F1=0.2527)
 python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json --threshold 0.3
 
-# 4. Repair audio (creates: .wav + .json report)
+# 5. Repair audio (creates: .wav + .json report)
 python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/FluencyBank_010_0_repaired.wav --mode attenuate --threshold 0.3
 
-# 5. Listen to result!
+# 6. Listen to result!
 # Open: output/repaired_audio/FluencyBank_010_0_repaired.wav 🎵
 ```
 
