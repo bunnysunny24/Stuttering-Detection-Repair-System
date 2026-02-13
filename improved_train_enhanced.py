@@ -202,21 +202,21 @@ class Trainer:
         # Loss function with class weights
         self.compute_class_weights()
         
-        # Optimizer - Lower LR for stability
+        # Optimizer - Much lower LR to prevent overfitting (was 1e-4, now 5e-5)
         self.optimizer = optim.AdamW(
             model.parameters(),
-            lr=1e-4,
-            weight_decay=1e-5,
+            lr=5e-5,
+            weight_decay=2e-5,
             betas=(0.9, 0.999)
         )
         
-        # Learning rate scheduler
+        # Learning rate scheduler - more aggressive reduction
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode='max',
-            factor=0.5,
-            patience=3,
-            min_lr=1e-6
+            factor=0.3,
+            patience=2,
+            min_lr=1e-7
         )
         
         # Metrics
@@ -225,9 +225,9 @@ class Trainer:
         # Amp scaler for mixed precision
         self.scaler = GradScaler()
         
-        # Early stopping
+        # Early stopping - DISABLED to allow full training (set to 31, so ~30 epochs without improvement)
         self.best_f1 = 0.0
-        self.early_stop_patience = 7
+        self.early_stop_patience = 31
         self.patience_counter = 0
     
     def compute_class_weights(self):

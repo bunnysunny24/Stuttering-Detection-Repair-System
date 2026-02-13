@@ -23,10 +23,11 @@ try:
 except Exception:
     torch = None
 
-from Models.model_cnn import SimpleCNN
-from Models.repair import load_audio, window_iter, predict_window
-from Models.asr_whisper import transcribe_to_words
-from Models.map_sed_words import map_windows_to_words, seconds_to_samples
+from model_cnn import SimpleCNN
+from model_enhanced import EnhancedStutteringCNN
+from repair import load_audio, window_iter, predict_window
+from asr_whisper import transcribe_to_words
+from map_sed_words import map_windows_to_words, seconds_to_samples
 
 
 def apply_word_level_repair(wave: np.ndarray, sr: int, word_records: list, mode: str = "attenuate", attenuate_db: float = 10.0, crossfade_ms: float = 10.0, preserve_silence_ms: float = 0.0):
@@ -130,8 +131,8 @@ def run_pipeline(args):
     except Exception:
         device = torch.device('cpu')
 
-    # load SED model
-    sed_model = SimpleCNN(n_mels=args.n_mels, n_classes=len(SimpleCNN().fc.bias))
+    # load SED model (Enhanced model)
+    sed_model = EnhancedStutteringCNN(n_mels=args.n_mels, n_classes=5)
     state = __import__('torch').load(args.model_path, map_location=device)
     sed_model.load_state_dict(state)
     sed_model.to(device)
@@ -150,7 +151,9 @@ def run_pipeline(args):
         except Exception:
             per_class_thresh = None
     if per_class_thresh is None:
-        per_class_thresh = [args.threshold] * len(SimpleCNN().fc.bias)
+        # Use stricter per-class thresholds since model is early-stage
+        # Prolongation and Block are more reliable; others are less confident
+        per_class_thresh = [0.6, 0.6, 0.65, 0.7, 0.65]  # Higher thresholds to reduce false positives
 
     provisional_flags = []
     window_bounds = []

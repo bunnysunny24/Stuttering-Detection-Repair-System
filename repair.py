@@ -36,8 +36,8 @@ try:
 except Exception:
     torch = None
 
-from Models.model_cnn import SimpleCNN
-from Models.features import waveform_to_logmel
+from model_cnn import SimpleCNN
+from features import waveform_to_logmel
 
 
 def load_audio(path: Path):

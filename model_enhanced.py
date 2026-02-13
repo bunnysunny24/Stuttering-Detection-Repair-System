@@ -101,11 +101,11 @@ class EnhancedStutteringCNN(nn.Module):
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.4),
+            nn.Dropout(0.5),  # Increased from 0.4
             nn.Linear(128, 64),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),  # Increased from 0.3
         )
         
         # Output layer (5 classes for 5 stuttering types)

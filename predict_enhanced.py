@@ -30,7 +30,7 @@ import sys
 # Import models
 from model_cnn import SimpleCNN
 from model_enhanced import EnhancedStutteringCNN
-from features import log_mel_spectrogram
+from features import waveform_to_logmel
 from asr_whisper import transcribe_to_words
 from repair import repair_audio
 import soundfile as sf
@@ -76,15 +76,15 @@ class StutterDetector:
         
         return model
     
-    def detect_stuttering(self, audio_path, threshold=0.5, window_size=1.0, hop_size=0.5):
+    def detect_stuttering(self, audio_path, threshold=0.3, window_size=256, hop_size=128):
         """
         Detect stuttering in audio file.
         
         Args:
             audio_path: Path to audio file
-            threshold: Classification threshold (0-1)
-            window_size: Window size in seconds
-            hop_size: Hop size in seconds
+            threshold: Classification threshold (0-1) - 0.3 for enhanced model
+            window_size: Window size in frames (256 = ~2.56s at 16kHz/160hop)
+            hop_size: Hop size in frames
         
         Returns:
             dict with detection results
@@ -94,15 +94,15 @@ class StutterDetector:
         duration = len(y) / sr
         
         # Compute features (should match training preprocessing)
-        X_mel = log_mel_spectrogram(y, sr=sr, n_mels=80)
+        X_mel = waveform_to_logmel(y, sr=sr, n_mels=80)
         
-        # Convert to target window size
+        # Use frame-based window (not time-based) to match training
         n_frames = X_mel.shape[1]
-        target_frames = int(window_size * sr / 160)  # 160 is hop length used in features.py
+        target_frames = window_size  # Use 256 frames like training
         
         # Sliding window inference
         detections = []
-        step = int(hop_size * sr / 160)
+        step = hop_size  # Use 128 frame hop
         
         for start_frame in range(0, max(1, n_frames - target_frames + 1), step):
             end_frame = min(start_frame + target_frames, n_frames)
@@ -113,8 +113,12 @@ class StutterDetector:
                 padding = target_frames - window.shape[1]
                 window = np.pad(window, ((0, 0), (0, padding)), mode='constant')
             
-            # Convert to tensor
+            # Convert to tensor - format: (batch=1, channels=1, mels=80, time=256)
             X_tensor = torch.from_numpy(window).unsqueeze(0).unsqueeze(0).float()
+            if X_tensor.shape != (1, 1, 80, target_frames):
+                # Ensure correct shape
+                X_tensor = torch.nn.functional.pad(X_tensor, (0, max(0, target_frames - X_tensor.shape[3])))
+                X_tensor = X_tensor[:, :, :, :target_frames]
             X_tensor = X_tensor.to(self.device)
             
             # Get predictions
@@ -195,8 +199,8 @@ def main():
                         help='Output JSON file')
     parser.add_argument('--output-dir', type=str, default=None,
                         help='Output directory for batch results')
-    parser.add_argument('--threshold', type=float, default=0.5,
-                        help='Detection threshold (0-1)')
+    parser.add_argument('--threshold', type=float, default=0.3,
+                        help='Detection threshold (0-1) - use 0.3 for enhanced model')
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu',
                         help='Device to use')
     parser.add_argument('--compare', action='store_true',
