@@ -232,9 +232,12 @@ class Trainer:
     
     def compute_class_weights(self):
         """Compute class weights for imbalanced data."""
+        print("Computing class weights from training data...")
         all_labels = []
-        for X, y in self.train_loader:
+        pbar = tqdm(self.train_loader, desc="Loading labels", ncols=80)
+        for X, y in pbar:
             all_labels.append(y.cpu().numpy())
+        pbar.close()
         all_labels = np.vstack(all_labels)
         
         # Use sklearn's balanced weights formula
