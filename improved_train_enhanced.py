@@ -202,10 +202,10 @@ class Trainer:
         # Loss function with class weights
         self.compute_class_weights()
         
-        # Optimizer
+        # Optimizer - Lower LR for stability
         self.optimizer = optim.AdamW(
             model.parameters(),
-            lr=1e-3,
+            lr=1e-4,
             weight_decay=1e-5,
             betas=(0.9, 0.999)
         )
@@ -237,13 +237,16 @@ class Trainer:
             all_labels.append(y.cpu().numpy())
         all_labels = np.vstack(all_labels)
         
-        # Negative weights (label = 0)
+        # Use sklearn's balanced weights formula
         pos_counts = all_labels.sum(axis=0)
-        neg_counts = (1 - all_labels).sum(axis=0)
-        weights = neg_counts / (pos_counts + 1e-6)
+        total = len(all_labels)
+        # weight_j = total / (num_classes * count_j)
+        weights = total / (2.0 * pos_counts + 1e-6)
         
-        # Normalize
+        # Normalize to mean=1
         weights = weights / weights.mean()
+        # Cap extreme weights
+        weights = np.minimum(weights, 5.0)
         
         self.class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
         print(f"Class weights: {self.class_weights.cpu().numpy()}")
@@ -296,7 +299,7 @@ class Trainer:
             with torch.no_grad():
                 probs = torch.sigmoid(logits).cpu()
                 y_pred_probs_all.append(probs.numpy())
-                y_pred_binary_all.append((probs > 0.5).numpy())
+                y_pred_binary_all.append((probs > 0.3).numpy())  # Lower threshold for better sensitivity
                 y_true_all.append(y.cpu().numpy())
             
             # Update progress bar with current loss
@@ -341,7 +344,7 @@ class Trainer:
                 
                 probs = torch.sigmoid(logits).cpu()
                 y_pred_probs_all.append(probs.numpy())
-                y_pred_binary_all.append((probs > 0.5).numpy())
+                y_pred_binary_all.append((probs > 0.3).numpy())  # Lower threshold for better sensitivity
                 y_true_all.append(y.cpu().numpy())
                 
                 # Update progress bar with current loss
