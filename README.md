@@ -1,3 +1,11 @@
+python Models/AGNI_TRAIN_AND_TEST.py --train --use_embeddings --epochs 30 --batch_size 32
+python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/best_checkpoint.pth --output thresholds.json
+python Models/finetune_wav2vec_peft.py --model_name facebook/wav2vec2-base-960h --output_dir Models/checkpoints/peft --per_device_train_batch_size 2 --learning_rate 1e-4 --num_train_epochs 10 --gradient_accumulation_steps 8 --use_lora --fp16
+
+python Models/AGNI_TRAIN_AND_TEST.py --evaluate --checkpoint <best_checkpoint_path>
+
+python Models/run_asr_map_repair.py --model_path <best_checkpoint_path> --input_file path/to/file.wav --output_file output/repaired.wav --threshold_file thresholds.json --mode attenuate
+
 # Stuttering Detection & Repair System ✅ PRODUCTION READY
 
 **Complete end-to-end system for detecting and repairing stuttered speech**
@@ -432,3 +440,4 @@ d:\AGNI\
 ✅ Ready for real-world deployment  
 
 **Ready to train?** Start with `python Models/COMPLETE_PIPELINE.py` ✨
+
