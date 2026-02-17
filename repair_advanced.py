@@ -33,11 +33,20 @@ from constants import TOTAL_CHANNELS
 
 try:
     import torch
+except Exception as e:
+    raise ImportError(f"Required library missing: {e}\nInstall with: pip install torch")
+
+# Try to import librosa but tolerate failures (numba/NumPy mismatches)
+try:
     import librosa
-    from scipy import signal
-    from scipy.fftpack import fft, ifft
-except ImportError as e:
-    raise ImportError(f"Required library missing: {e}\nInstall with: pip install torch librosa scipy soundfile")
+    _LIBROSA_AVAILABLE = True
+except Exception as e:
+    librosa = None
+    _LIBROSA_AVAILABLE = False
+    warnings.warn(f"librosa unavailable or failed to import: {e}. Falling back to SciPy implementations.")
+
+from scipy import signal as spsignal
+from scipy.fftpack import fft, ifft, dct
 
 
 class AdvancedStutteringRepair:
@@ -121,15 +130,34 @@ class AdvancedStutteringRepair:
     def _fallback_stutter_detection(self, audio):
         """FIXED: Fallback stutter detection using signal analysis."""
         try:
-            # Compute MFCC
-            mfcc = librosa.feature.mfcc(
-                y=audio, 
-                sr=self.sr, 
-                n_mfcc=13,
-                n_fft=self.n_fft,
-                hop_length=self.hop_length
-            )
-            
+            # Prefer using EnhancedAudioPreprocessor (robust, SciPy fallback)
+            try:
+                from enhanced_audio_preprocessor import EnhancedAudioPreprocessor
+                pre = EnhancedAudioPreprocessor(sr=self.sr, n_fft=self.n_fft, hop_length=self.hop_length)
+                features = pre.extract_features_from_array(audio, sr=self.sr)
+                if features is None:
+                    raise RuntimeError("Feature extraction returned None")
+                # combined_features layout: mel(80), mfcc(13), mfcc_delta(13), mfcc_delta2(13), ...
+                mfcc = features[80:80+13, :]
+            except Exception:
+                # Last-resort: use librosa if available
+                if _LIBROSA_AVAILABLE:
+                    mfcc = librosa.feature.mfcc(
+                        y=audio,
+                        sr=self.sr,
+                        n_mfcc=13,
+                        n_fft=self.n_fft,
+                        hop_length=self.hop_length
+                    )
+                else:
+                    # Fallback: simple spectrogram energy across bands
+                    f, t_spec, Zxx = spsignal.stft(audio, fs=self.sr, window='hann', nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length, boundary=None)
+                    mag = np.abs(Zxx)
+                    # Collapse frequency axis to pseudo-MFCC by taking log energy in coarse bands
+                    n_mfcc = 13
+                    bands = np.array_split(np.arange(mag.shape[0]), n_mfcc)
+                    mfcc = np.vstack([np.log1p(np.sum(mag[b], axis=0)) for b in bands])
+
             # Compute energy
             energy = np.sqrt(np.sum(mfcc**2, axis=0))
             
@@ -272,14 +300,24 @@ class AdvancedStutteringRepair:
         """FIXED: Stretch audio segment using phase vocoder."""
         if factor == 1.0 or len(audio_segment) < self.n_fft:
             return audio_segment
-        
+
         try:
-            D = librosa.stft(audio_segment, n_fft=self.n_fft, hop_length=self.hop_length)
-            D_stretched = librosa.phase_vocoder(D, rate=factor, hop_length=self.hop_length)
-            audio_stretched = librosa.istft(D_stretched, hop_length=self.hop_length, length=len(audio_segment))
-            
-            return audio_stretched
-            
+            if _LIBROSA_AVAILABLE:
+                D = librosa.stft(audio_segment, n_fft=self.n_fft, hop_length=self.hop_length)
+                D_stretched = librosa.phase_vocoder(D, rate=factor, hop_length=self.hop_length)
+                audio_stretched = librosa.istft(D_stretched, hop_length=self.hop_length, length=len(audio_segment))
+                return audio_stretched
+            else:
+                # Simple fallback: resample to change duration
+                import math
+                target_len = max(1, int(len(audio_segment) / factor))
+                audio_stretched = spsignal.resample(audio_segment, target_len)
+                # If resampled length differs, pad/trim to original length for stability
+                if len(audio_stretched) > len(audio_segment):
+                    audio_stretched = audio_stretched[:len(audio_segment)]
+                else:
+                    audio_stretched = np.pad(audio_stretched, (0, len(audio_segment) - len(audio_stretched)), mode='edge')
+                return audio_stretched
         except Exception as e:
             print(f"Phase vocoder failed: {e}")
             return audio_segment
@@ -312,36 +350,42 @@ class AdvancedStutteringRepair:
                 continue
             
             try:
-                # Get magnitude and phase
-                S_before = librosa.stft(context_before, n_fft=self.n_fft, hop_length=self.hop_length)
-                S_after = librosa.stft(context_after, n_fft=self.n_fft, hop_length=self.hop_length)
-                
+                # Get magnitude and phase using librosa if possible, else scipy
+                if _LIBROSA_AVAILABLE:
+                    S_before = librosa.stft(context_before, n_fft=self.n_fft, hop_length=self.hop_length)
+                    S_after = librosa.stft(context_after, n_fft=self.n_fft, hop_length=self.hop_length)
+                else:
+                    S_before = spsignal.stft(context_before, fs=self.sr, window='hann', nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length, boundary=None)[2]
+                    S_after = spsignal.stft(context_after, fs=self.sr, window='hann', nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length, boundary=None)[2]
+
                 # FIXED: Handle dimension mismatch
                 min_frames = min(S_before.shape[1], S_after.shape[1])
-                
+
                 # Average magnitude
                 mag_avg = (np.abs(S_before[:, :min_frames]) + np.abs(S_after[:, :min_frames])) / 2.0
-                
+
                 # Reconstruct with averaged magnitude and interpolated phase
                 phase_before = np.angle(S_before[:, :min_frames])
-                phase_after = np.angle(S_after[:, :min_frames])
                 phase_interp = phase_before  # Use before phase for continuity
-                
+
                 S_inpainted = mag_avg * np.exp(1j * phase_interp)
-                
+
                 # Inverse transform
-                repaired_segment = librosa.istft(S_inpainted, hop_length=self.hop_length)
-                
+                if _LIBROSA_AVAILABLE:
+                    repaired_segment = librosa.istft(S_inpainted, hop_length=self.hop_length)
+                else:
+                    repaired_segment = spsignal.istft(S_inpainted, fs=self.sr, window='hann', nperseg=self.n_fft, noverlap=self.n_fft - self.hop_length, input_onesided=True)[1]
+
                 # FIXED: Handle length mismatch
                 gap_len = end_samp - start_samp
                 if len(repaired_segment) > gap_len:
                     repaired_segment = repaired_segment[:gap_len]
                 elif len(repaired_segment) < gap_len:
                     repaired_segment = np.pad(repaired_segment, (0, gap_len - len(repaired_segment)), mode='edge')
-                
+
                 # Replace with inpainted segment
                 repaired[start_samp:end_samp] = repaired_segment
-                
+
             except Exception as e:
                 print(f"Inpainting failed for region {start_time:.2f}-{end_time:.2f}: {e}")
                 # Fallback: simple fade out

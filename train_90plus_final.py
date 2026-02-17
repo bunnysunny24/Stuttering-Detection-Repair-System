@@ -32,6 +32,42 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
+# Suppress noisy decorative separator lines printed by imported modules or
+# legacy scripts. This replaces sys.stdout/sys.stderr with a light filter that
+# drops writes that consist only of repeated '=' characters (and optional
+# whitespace/newline) so the training progress output remains readable.
+import sys as _sys
+_original_stdout = _sys.stdout
+_original_stderr = _sys.stderr
+
+class _SeparatorFilter:
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    def write(self, s):
+        try:
+            # Only consider string-like writes; ignore non-str
+            if not isinstance(s, str):
+                return self._wrapped.write(s)
+
+            stripped = s.strip('\r\n')
+            # If the stripped content is only '=' characters and long, drop it
+            if len(stripped) >= 10 and set(stripped) == {'='}:
+                return
+            return self._wrapped.write(s)
+        except Exception:
+            # On any error, fallback to original writer
+            return self._wrapped.write(s)
+
+    def flush(self):
+        try:
+            return self._wrapped.flush()
+        except Exception:
+            return None
+
+_sys.stdout = _SeparatorFilter(_original_stdout)
+_sys.stderr = _SeparatorFilter(_original_stderr)
+
 # Add current directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -306,7 +342,11 @@ class AudioDataset(Dataset):
 
         # Load labels if available, otherwise create dummy labels (all zeros)
         if 'labels' in data:
-            labels = torch.from_numpy(data['labels']).float()
+            # Labels in NPZs were stored as ordinal/integer (0..N).
+            # Convert to binary presence indicator: positive if label > 0.
+            lbl = np.asarray(data['labels'])
+            lbl_bin = (lbl > 0).astype(np.float32)
+            labels = torch.from_numpy(lbl_bin).float()
         else:
             labels = torch.zeros(NUM_CLASSES, dtype=torch.float32)
 
@@ -622,8 +662,10 @@ class Trainer:
                     labels = d.get('labels')
                     if labels is None:
                         continue
-                    labels = _np.asarray(labels).astype(int)
-                    counts_pos += labels
+                    labels = _np.asarray(labels)
+                    # Treat any non-zero label as positive (binary presence)
+                    labels_bin = (labels > 0).astype(int)
+                    counts_pos += labels_bin
                     total_files += 1
                 except Exception:
                     continue
@@ -785,17 +827,18 @@ class Trainer:
             for batch_idx, (X, y) in enumerate(pbar):
                 X = X.to(self.device)
                 y = y.to(self.device)
-                
+
                 logits = self.model(X)
-                loss = self.focal_loss(logits, y)
+                # Use configured criterion (FocalLoss or LabelSmoothingBCELoss)
+                loss = self.criterion(logits, y)
                 total_loss += loss.item()
-                
+
                 probs = torch.sigmoid(logits).cpu().numpy()
                 y_pred_probs_all.append(probs)
                 y_true_all.append(y.cpu().numpy())
-                
+
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-                
+
                 # Clear GPU cache every 10 batches
                 if batch_idx % 10 == 0:
                     torch.cuda.empty_cache()
@@ -865,9 +908,7 @@ class Trainer:
     
     def train(self, num_epochs):
         """Full training loop."""
-        print(f"\n{'='*80}")
-        print(f"TRAINING 90+ ACCURACY MODEL")
-        print(f"{'='*80}")
+        print("\n=== TRAINING 90+ ACCURACY MODEL ===")
         print(f"Model: {self.model_name.upper()}")
         print(f"Epochs: {num_epochs}")
         print(f"Batch size: {len(next(iter(self.train_loader))[0])}")
@@ -894,14 +935,13 @@ class Trainer:
                     print(f"{class_name}({recall*100:.1f}%) ", end="")
                 print()
             
-            print(f"  {'='*76}")
+            print('-' * 60)
             
             if self.should_stop():
                 print(f"\n✓ Early stopping at epoch {epoch + 1}")
                 break
         
-        print(f"\n{'='*80}")
-        print(f"TRAINING COMPLETE")
+        print("\n=== TRAINING COMPLETE ===")
         if self.metrics.best_epoch_info:
             info = self.metrics.best_epoch_info
             print(f"Best Model: Epoch {info['epoch']}")
@@ -909,7 +949,7 @@ class Trainer:
             print(f"  Location: Models/checkpoints/{self.model_name}_best.pth")
         else:
             print(f"Best F1: {self.best_f1:.4f}")
-        print(f"{'='*80}\n")
+        print('\n')
         
         # Final GPU cleanup
         torch.cuda.empty_cache()
@@ -969,6 +1009,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file = output_dir / f'training_{training_timestamp}.log'
     sys.stdout = DualLogger(str(log_file))
+    # Reduce noisy INFO logs from libraries during training
+    logging.getLogger().setLevel(logging.WARNING)
     
     print(f"✓ Training session: {training_timestamp}")
     print(f"✓ Training log: {log_file}")

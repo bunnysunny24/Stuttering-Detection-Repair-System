@@ -20,9 +20,14 @@ from typing import Optional, Dict, List, Any
 # Add Models to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-print("=" * 80)
-print("IMPORT DIAGNOSTICS")
-print("=" * 80)
+# Suppress loud import diagnostic banners in normal runs
+if os.environ.get('PIPELINE_VERBOSE_IMPORTS', '0') == '1':
+    print("=" * 80)
+    print("IMPORT DIAGNOSTICS")
+    print("=" * 80)
+else:
+    # minimal import note for brief logs
+    print("IMPORTS: compact mode (set PIPELINE_VERBOSE_IMPORTS=1 for details)")
 
 # Import components with VERBOSE error reporting
 FeatureExtractionPipeline = None
