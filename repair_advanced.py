@@ -37,13 +37,39 @@ except Exception as e:
     raise ImportError(f"Required library missing: {e}\nInstall with: pip install torch")
 
 # Try to import librosa but tolerate failures (numba/NumPy mismatches)
+def _check_librosa_compat():
+    try:
+        import numpy as _np
+        v = _np.__version__
+        parts = v.split('.')
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        if major > 2 or (major == 2 and minor > 1):
+            return False, f"NumPy {v} likely incompatible with librosa/numba (requires <=2.1.x)"
+    except Exception:
+        pass
+    return True, ''
+
+librosa = None
+_LIBROSA_AVAILABLE = False
+_LIBROSA_IMPORT_SKIPPED_REASON = ''
 try:
-    import librosa
-    _LIBROSA_AVAILABLE = True
-except Exception as e:
+    ok, reason = _check_librosa_compat()
+    if not ok:
+        _LIBROSA_IMPORT_SKIPPED_REASON = reason
+        _LIBROSA_AVAILABLE = False
+    else:
+        try:
+            import librosa
+            _LIBROSA_AVAILABLE = True
+        except Exception as e:
+            librosa = None
+            _LIBROSA_AVAILABLE = False
+            _LIBROSA_IMPORT_SKIPPED_REASON = str(e)
+            warnings.warn(f"librosa unavailable or failed to import: {e}. Falling back to SciPy implementations.")
+except Exception:
     librosa = None
     _LIBROSA_AVAILABLE = False
-    warnings.warn(f"librosa unavailable or failed to import: {e}. Falling back to SciPy implementations.")
 
 from scipy import signal as spsignal
 from scipy.fftpack import fft, ifft, dct
@@ -58,6 +84,21 @@ class AdvancedStutteringRepair:
         self.hop_length = hop_length
         self.model_path = model_path
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # Load thresholds if present (used to be conservative in repair)
+        self.thresholds = None
+        self.min_duration_s = 0.2  # default min duration for repair (200ms)
+        try:
+            import json
+            th_path = Path('output/thresholds.json')
+            if th_path.exists():
+                with open(th_path, 'r') as f:
+                    payload = json.load(f)
+                    self.thresholds = payload.get('thresholds')
+                    if self.thresholds is not None:
+                        self.thresholds = [float(t) for t in self.thresholds]
+                        print(f"Loaded thresholds from {th_path}: {self.thresholds}")
+        except Exception:
+            pass
         
         # Use centralized TOTAL_CHANNELS
         self.TOTAL_CHANNELS = TOTAL_CHANNELS
@@ -69,6 +110,13 @@ class AdvancedStutteringRepair:
         elif model_path:
             print(f"⚠ Model path does not exist: {model_path}")
             print("  Will use fallback detection method")
+
+        # Inform about librosa availability reason
+        try:
+            if not _LIBROSA_AVAILABLE and _LIBROSA_IMPORT_SKIPPED_REASON:
+                print(f"librosa disabled: {_LIBROSA_IMPORT_SKIPPED_REASON}. Using SciPy fallbacks. To enable librosa, install pinned deps: requirements_models.txt")
+        except Exception:
+            pass
     
     def _load_model(self, model_path):
         """FIXED: Load trained stuttering detection model with correct parameters."""
@@ -254,8 +302,16 @@ class AdvancedStutteringRepair:
                     logits = self.model(x)
                     probs = torch.sigmoid(logits).cpu().numpy()[0]
                 
-                # If any stutter class > 0.5, mark as stutter
-                if np.max(probs) > 0.5:
+                # Apply per-class thresholds if available, else 0.5
+                if self.thresholds is not None and len(self.thresholds) == len(probs):
+                    passes = [probs[i] > self.thresholds[i] for i in range(len(probs))]
+                    is_stutter = any(passes)
+                else:
+                    is_stutter = np.max(probs) > 0.5
+
+                # If predicted, check duration filter: require window length >= min_duration_s
+                window_duration = (end - start)
+                if is_stutter and window_duration >= self.min_duration_s:
                     start_time = start / self.sr
                     end_time = end / self.sr
                     stutter_regions.append((start_time, end_time))

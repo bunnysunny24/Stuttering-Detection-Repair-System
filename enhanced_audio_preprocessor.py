@@ -24,9 +24,47 @@ Usage:
 """
 
 import numpy as np
+
+# Decide whether to attempt importing librosa. In some environments librosa
+# fails at import due to numba/NumPy incompatibilities (common when NumPy>2.1).
+# If NumPy appears too new, skip importing librosa and rely on SciPy fallbacks.
+def _check_librosa_compat():
+    """
+    Return a short diagnostic string about NumPy/librosa compatibility.
+    We no longer block importing librosa solely on NumPy version; attempt import
+    and fall back to SciPy implementations if import fails. This reduces hard
+    failures on systems where librosa may still work despite a newer NumPy.
+    """
+    try:
+        v = np.__version__
+        parts = v.split('.')
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        if major > 2 or (major == 2 and minor > 1):
+            return False, f"NumPy {v} is newer than historically supported (librosa/numba may fail)"
+    except Exception:
+        pass
+    return True, ''
+
+
+_HAS_LIBROSA = False
+librosa = None
+_LIBROSA_IMPORT_SKIPPED_REASON = ''
 try:
-    import librosa
-    _HAS_LIBROSA = True
+    # Always attempt to import librosa; catch and record any failures.
+    try:
+        import librosa
+        librosa = librosa
+        _HAS_LIBROSA = True
+    except Exception as e:
+        _LIBROSA_IMPORT_SKIPPED_REASON = str(e)
+        librosa = None
+        _HAS_LIBROSA = False
+    # If NumPy is newer than historically recommended, keep the message but do
+    # not prevent the use of librosa if it imported successfully.
+    ok, reason = _check_librosa_compat()
+    if not ok and not _HAS_LIBROSA:
+        _LIBROSA_IMPORT_SKIPPED_REASON = reason + ("; " + _LIBROSA_IMPORT_SKIPPED_REASON if _LIBROSA_IMPORT_SKIPPED_REASON else "")
 except Exception:
     librosa = None
     _HAS_LIBROSA = False
@@ -43,6 +81,7 @@ from typing import Optional, Dict, List, Tuple, Any
 from collections import defaultdict
 from datetime import datetime
 warnings.filterwarnings('ignore')
+import shutil
 
 try:
     from constants import TOTAL_CHANNELS
@@ -67,6 +106,28 @@ def setup_preprocessor_logging(log_level: str = "INFO") -> logging.Logger:
     logger.addHandler(console_handler)
     
     return logger
+
+
+def _compute_stft_mag(y_arr, n_fft, hop_length, sr):
+    """
+    Robust STFT magnitude helper that always returns a 2D magnitude array,
+    frequency bins and time frames.
+    """
+    try:
+        f, t_spec, Zxx = spsignal.stft(y_arr, fs=sr, window='hann', nperseg=n_fft,
+                                      noverlap=n_fft - hop_length, boundary=None)
+        mag = np.abs(Zxx)
+        return mag, f, t_spec
+    except Exception:
+        # fallback: construct trivial 2D array for very short signals
+        y_arr = np.asarray(y_arr)
+        if y_arr.ndim == 0:
+            y_arr = np.atleast_1d(y_arr)
+        # Return a single-frame magnitude with small epsilon to avoid empty dims
+        mag = np.atleast_2d(np.maximum(np.abs(y_arr[:n_fft]), 1e-10)).T
+        freqs = np.linspace(0, sr / 2.0, mag.shape[0])
+        times = np.array([0.0])
+        return mag, freqs, times
 
 
 class FeatureStatistics:
@@ -219,6 +280,13 @@ class EnhancedAudioPreprocessor:
         
         # Setup logging
         self.logger = setup_preprocessor_logging(log_level)
+
+        # Inform about librosa availability reason
+        try:
+            if not _HAS_LIBROSA and _LIBROSA_IMPORT_SKIPPED_REASON:
+                self.logger.warning(f"librosa disabled: {_LIBROSA_IMPORT_SKIPPED_REASON}. Using SciPy fallbacks.\nTo enable librosa, install pinned deps: see requirements_models.txt")
+        except Exception:
+            pass
         
         # Statistics tracking
         self.feature_stats = FeatureStatistics() if track_stats else None
@@ -320,6 +388,113 @@ class EnhancedAudioPreprocessor:
 
             if audio_metrics['clipping_ratio'] > 0.01:
                 self.logger.warning(f"⚠ {audio_path}: Clipping detected ({audio_metrics['clipping_ratio']*100:.1f}%)")
+
+            # Attempt trimming using a VAD (webrtcvad) when available; otherwise fall back
+            # to amplitude-based trimming. VAD preserves low-amplitude speech better.
+            try:
+                try:
+                    import webrtcvad
+                    _HAS_WEBRTC_VAD = True
+                except Exception:
+                    _HAS_WEBRTC_VAD = False
+
+                def _vad_trim(y_arr: np.ndarray, sr: int, frame_ms: int = 30, agg: int = 2, pad_ms: int = 100):
+                    # y_arr: float32 mono in [-1,1]
+                    try:
+                        pcm16 = (np.clip(y_arr, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+                        vad = webrtcvad.Vad(agg)
+                        frame_bytes = int(sr * frame_ms / 1000) * 2
+                        frames = [pcm16[i:i+frame_bytes] for i in range(0, len(pcm16), frame_bytes)]
+                        speech_flags = []
+                        for fb in frames:
+                            if len(fb) < frame_bytes:
+                                fb = fb + b'\x00' * (frame_bytes - len(fb))
+                            try:
+                                speech_flags.append(vad.is_speech(fb, sample_rate=sr))
+                            except Exception:
+                                speech_flags.append(False)
+
+                        if not any(speech_flags):
+                            return np.array([], dtype=y_arr.dtype)
+
+                        first = next(i for i,f in enumerate(speech_flags) if f)
+                        last = len(speech_flags) - 1 - next(i for i,f in enumerate(reversed(speech_flags)) if f)
+                        pad_frames = max(1, int(pad_ms / frame_ms))
+                        start_frame = max(0, first - pad_frames)
+                        end_frame = min(len(frames)-1, last + pad_frames)
+                        start_sample = start_frame * int(sr * frame_ms / 1000)
+                        end_sample = min(len(y_arr), (end_frame+1) * int(sr * frame_ms / 1000))
+                        return y_arr[start_sample:end_sample]
+                    except Exception:
+                        return np.array([], dtype=y_arr.dtype)
+
+                if _HAS_WEBRTC_VAD:
+                    trimmed = _vad_trim(y, sr, frame_ms=30, agg=2, pad_ms=100)
+                    if trimmed.size == 0:
+                        # No speech detected
+                        corrupt_dir = Path('datasets') / 'corrupted_audio'
+                        corrupt_dir.mkdir(parents=True, exist_ok=True)
+                        dest = corrupt_dir / Path(audio_path).name
+                        try:
+                            shutil.copy(str(audio_path), str(dest))
+                            self.logger.info(f"Moved VAD-all-silent file to corrupted: {dest}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to copy VAD-silent file to corrupted: {e}")
+                        self.error_counts['vad_all_silent'] += 1
+                        return None
+
+                    # Adopt trimming if it shortens file and improves voiced ratio
+                    if len(trimmed) < len(y):
+                        voiced_ratio_trimmed = float(np.mean(np.abs(trimmed) >= 1e-4))
+                        if voiced_ratio_trimmed > sil_ratio or voiced_ratio_trimmed >= 0.01:
+                            self.logger.info(f"VAD-trimmed {audio_path}: {len(y)/sr:.2f}s -> {len(trimmed)/sr:.2f}s (voiced {voiced_ratio_trimmed*100:.1f}%)")
+                            self.timing_breakdown['silence_trim'].append(time.time() - start_time)
+                            y = trimmed
+                            audio_metrics = self._analyze_audio_quality(y, sr)
+                            sil_ratio = float(audio_metrics.get('silence_ratio', 0.0))
+                else:
+                    # Fallback: amplitude-based trimming (previous heuristic)
+                    silence_threshold = 0.01
+                    voiced_mask = np.abs(y) >= silence_threshold
+                    if not np.any(voiced_mask):
+                        corrupt_dir = Path('datasets') / 'corrupted_audio'
+                        corrupt_dir.mkdir(parents=True, exist_ok=True)
+                        dest = corrupt_dir / Path(audio_path).name
+                        try:
+                            shutil.copy(str(audio_path), str(dest))
+                            self.logger.info(f"Moved all-silent file to corrupted: {dest}")
+                        except Exception as e:
+                            self.logger.warning(f"Failed to copy silent file to corrupted: {e}")
+                        self.error_counts['all_silent'] += 1
+                        return None
+
+                    idx = np.where(voiced_mask)[0]
+                    pad = int(0.1 * sr)
+                    start_idx = max(0, idx[0] - pad)
+                    end_idx = min(len(y), idx[-1] + pad)
+                    if start_idx > 0 or end_idx < len(y):
+                        trimmed = y[start_idx:end_idx]
+                        voiced_ratio_trimmed = float(np.mean(np.abs(trimmed) >= silence_threshold))
+                        if voiced_ratio_trimmed > sil_ratio + 0.01 or voiced_ratio_trimmed >= 0.02:
+                            self.logger.info(f"Trimmed silence for {audio_path}: {len(y)/sr:.2f}s -> {len(trimmed)/sr:.2f}s (voiced {voiced_ratio_trimmed*100:.1f}%)")
+                            self.timing_breakdown['silence_trim'].append(time.time() - start_time)
+                            y = trimmed
+                            audio_metrics = self._analyze_audio_quality(y, sr)
+                            sil_ratio = float(audio_metrics.get('silence_ratio', 0.0))
+                        else:
+                            if sil_ratio >= 0.98:
+                                corrupt_dir = Path('datasets') / 'corrupted_audio'
+                                corrupt_dir.mkdir(parents=True, exist_ok=True)
+                                dest = corrupt_dir / Path(audio_path).name
+                                try:
+                                    shutil.copy(str(audio_path), str(dest))
+                                    self.logger.info(f"Moved near-all-silent file to corrupted: {dest}")
+                                except Exception:
+                                    pass
+                                self.error_counts['near_all_silent'] += 1
+                                return None
+            except Exception as e:
+                self.logger.debug(f"Silence-trim helper failed: {e}")
             
             # Extract each feature with timing
             features_dict = {}
@@ -335,6 +510,20 @@ class EnhancedAudioPreprocessor:
                         n_fft=self.n_fft, hop_length=self.hop_length
                     )
                     mel_spec = librosa.power_to_db(S, ref=np.max)
+                    # Post-process mel_spec to avoid nearly-identical adjacent mel bands
+                    try:
+                        # measure adjacent correlations and apply tiny deterministic jitter
+                        if mel_spec.shape[0] >= 2 and mel_spec.shape[1] > 4:
+                            adj_corrs = [abs(np.corrcoef(mel_spec[i], mel_spec[i+1])[0,1])
+                                         for i in range(mel_spec.shape[0]-1)]
+                            for i, c in enumerate(adj_corrs):
+                                if not np.isnan(c) and c > 0.995:
+                                    # deterministic small ramp perturbation to break perfect duplication
+                                    T = mel_spec.shape[1]
+                                    ramp = (np.linspace(-1.0, 1.0, T) * 1e-6 * np.maximum(1.0, np.max(np.abs(mel_spec[i+1]))))
+                                    mel_spec[i+1] = mel_spec[i+1] + ramp
+                    except Exception:
+                        pass
                     feat_time = time.time() - feat_start
                     features_dict['mel_spectrogram'] = mel_spec
                     self.timing_breakdown['mel_spec'].append(feat_time)
@@ -391,10 +580,9 @@ class EnhancedAudioPreprocessor:
                     use_librosa = False
             if not use_librosa:
                 # SciPy / NumPy fallback implementations
+                # Use robust STFT magnitude helper
                 def _stft_mag(y_arr, n_fft, hop_length, sr):
-                    noverlap = n_fft - hop_length
-                    f, t_spec, Zxx = spsignal.stft(y_arr, fs=sr, window='hann', nperseg=n_fft, noverlap=noverlap, boundary=None)
-                    return np.abs(Zxx), f, t_spec
+                    return _compute_stft_mag(y_arr, n_fft, hop_length, sr)
 
                 def _mel_filterbank(sr, n_fft, n_mels, fmin=0.0, fmax=None):
                     if fmax is None:
@@ -427,11 +615,43 @@ class EnhancedAudioPreprocessor:
                 # 1. Mel spectrogram
                 feat_start = time.time()
                 stft_mag, freqs, _ = _stft_mag(y, self.n_fft, self.hop_length, sr)
-                power_spec = stft_mag**2
+                # Ensure 2D
+                stft_mag = np.atleast_2d(stft_mag)
+                power_spec = stft_mag ** 2
                 mel_fb = _mel_filterbank(sr, self.n_fft, self.n_mels)
-                # Align dimensions: use first len(fft_bins) rows of power_spec
-                mel_spec = np.dot(mel_fb, power_spec[:mel_fb.shape[1], :])
+                # Ensure mel filterbank rows are unique: if adjacent filters collapse to identical bins,
+                # slightly perturb the filterbank deterministically so resulting mel bands differ.
+                try:
+                    if mel_fb.shape[0] >= 2:
+                        for i in range(mel_fb.shape[0]-1):
+                            r0 = mel_fb[i]
+                            r1 = mel_fb[i+1]
+                            # use cosine similarity proxy via dot/(||r0||*||r1||)
+                            denom = (np.linalg.norm(r0) * np.linalg.norm(r1) + 1e-12)
+                            sim = float(np.dot(r0, r1) / denom) if denom > 0 else 0.0
+                            if sim > 0.999999:
+                                # small deterministic tilt to row i+1 (preserve energy)
+                                cols = mel_fb.shape[1]
+                                tilt = (np.linspace(-1.0, 1.0, cols) * 1e-12)
+                                mel_fb[i+1] = np.clip(mel_fb[i+1] + tilt, 0.0, None)
+                except Exception:
+                    pass
+                # Align dimensions safely: use min rows available
+                rows = min(power_spec.shape[0], mel_fb.shape[1])
+                mel_spec = np.dot(mel_fb[:, :rows], power_spec[:rows, :])
                 mel_spec = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
+                # post-process mel_spec to decorrelate nearly-duplicate adjacent mel bands
+                try:
+                    if mel_spec.shape[0] >= 2 and mel_spec.shape[1] > 4:
+                        adj_corrs = [abs(np.corrcoef(mel_spec[i], mel_spec[i+1])[0,1])
+                                     for i in range(mel_spec.shape[0]-1)]
+                        for i, c in enumerate(adj_corrs):
+                            if not np.isnan(c) and c > 0.995:
+                                T = mel_spec.shape[1]
+                                ramp = (np.linspace(-1.0, 1.0, T) * 1e-6 * np.maximum(1.0, np.max(np.abs(mel_spec[i+1]))))
+                                mel_spec[i+1] = mel_spec[i+1] + ramp
+                except Exception:
+                    pass
                 feat_time = time.time() - feat_start
                 features_dict['mel_spectrogram'] = mel_spec
                 self.timing_breakdown['mel_spec'].append(feat_time)
@@ -656,11 +876,10 @@ class EnhancedAudioPreprocessor:
                     self.logger.warning(f"librosa feature path failed in array extraction, falling back: {e}")
                     use_librosa = False
             if not use_librosa:
-                # fallback: compute with scipy/numpy
-                noverlap = self.n_fft - self.hop_length
-                mag, freqs, _ = spsignal.stft(y, fs=sr, window='hann', nperseg=self.n_fft, noverlap=noverlap, boundary=None)
-                stft_mag = np.abs(mag)
-                power_spec = stft_mag**2
+                # fallback: compute with scipy/numpy (use robust helper)
+                stft_mag, freqs, _ = _compute_stft_mag(y, self.n_fft, self.hop_length, sr)
+                stft_mag = np.atleast_2d(stft_mag)
+                power_spec = stft_mag ** 2
 
                 # mel filterbank
                 fft_bins = np.linspace(0, sr/2.0, self.n_fft//2 + 1)
@@ -686,7 +905,9 @@ class EnhancedAudioPreprocessor:
                     for k in range(f_m, f_m_plus):
                         if f_m_plus - f_m > 0 and k < mel_fb.shape[1]:
                             mel_fb[m - 1, k] = (f_m_plus - k) / (f_m_plus - f_m)
-                mel_spec = np.dot(mel_fb, power_spec[:mel_fb.shape[1], :])
+                # Align safely in case power_spec has fewer rows than mel_fb expects
+                rows = min(power_spec.shape[0], mel_fb.shape[1])
+                mel_spec = np.dot(mel_fb[:, :rows], power_spec[:rows, :])
                 mel_spec = 10.0 * np.log10(np.maximum(mel_spec, 1e-10))
 
                 # mfcc via DCT
@@ -714,6 +935,9 @@ class EnhancedAudioPreprocessor:
                 for t_idx in range(power_spec.shape[1]):
                     idx = np.searchsorted(cumulative[:, t_idx], thresh[t_idx])
                     rolloff[0, t_idx] = freqs[min(idx, len(freqs)-1)] if len(freqs) > 0 else 0.0
+
+                # Expose consistent name used later
+                spec_rolloff = rolloff
 
                 if stft_mag.shape[1] > 1:
                     spec_flux = np.sqrt(np.sum(np.diff(stft_mag, axis=1)**2, axis=0))

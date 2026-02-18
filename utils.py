@@ -18,31 +18,43 @@ import numpy as _np
 
 
 class FocalLoss(torch.nn.Module):
-    """Multi-label focal loss (for logits).
+    """Multi-label focal loss (for logits) with optional `pos_weight` support.
 
-    Implements a numerically-stable focal loss built on BCEWithLogitsLoss.
-    alpha: weighting factor for positive class (float or list per-class)
-    gamma: focusing parameter
+    Uses BCEWithLogitsLoss under the hood to allow `pos_weight`.
     """
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+    def __init__(self, alpha=1.0, gamma=2.0, pos_weight=None, reduction='mean'):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
+        # pos_weight can be a tensor or None; pass to BCEWithLogitsLoss
+        self.pos_weight = None
+        if pos_weight is not None:
+            try:
+                self.pos_weight = torch.as_tensor(pos_weight, dtype=torch.float32)
+            except Exception:
+                self.pos_weight = None
 
     def forward(self, logits, targets):
         # logits: (N, C), targets: {0,1} same shape
         prob = torch.sigmoid(logits)
         targets = targets.type_as(prob)
-        ce_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+
+        # Use BCEWithLogitsLoss with optional pos_weight per-class
+        if self.pos_weight is not None:
+            loss_ce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none', pos_weight=self.pos_weight.to(logits.device))
+        else:
+            loss_ce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+
         p_t = prob * targets + (1 - prob) * (1 - targets)
-        loss = ce_loss * ((1 - p_t) ** self.gamma)
+        loss = loss_ce * ((1 - p_t) ** self.gamma)
+
         if isinstance(self.alpha, (float, int)):
             loss = loss * self.alpha
         else:
-            # per-class alpha
             alpha_t = torch.as_tensor(self.alpha, dtype=loss.dtype, device=loss.device)
             loss = loss * alpha_t.unsqueeze(0)
+
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':

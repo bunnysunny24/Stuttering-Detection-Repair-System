@@ -369,6 +369,14 @@ class FeatureExtractionPipeline:
         # Analyze label distribution
         if total_loaded > 0:
             self._analyze_label_distribution()
+
+        # Expand any coarse-grained labels (e.g., show-level entries like 'FluencyBank')
+        # by mapping them to matching audio file stems present in the clips directory.
+        try:
+            self._expand_prefix_labels()
+        except Exception:
+            self.logger.debug('Failed to expand prefix labels', exc_info=True)
+
     
     def _parse_label_file(self, csv_path: Path) -> int:
         """
@@ -474,6 +482,37 @@ class FeatureExtractionPipeline:
             float(row.get('WordRep', 0)),
             float(row.get('Interjection', 0))
         ], dtype=np.float32)
+
+    def _expand_prefix_labels(self):
+        """
+        For any label keys that look like coarse prefixes (no underscore or short names),
+        find audio files in the clips directory whose stem starts with that prefix and
+        expand the label_map to include those stems if not already present.
+        """
+        # collect candidate prefixes (keys without underscore)
+        prefixes = [k for k in list(self.label_map.keys()) if '_' not in k]
+        if not prefixes:
+            return
+
+        self.logger.info(f"Expanding {len(prefixes)} prefix-style labels to matching audio files")
+
+        # build set of audio stems available
+        audio_files = self.find_audio_files()
+        audio_stems = {p.stem for p in audio_files}
+
+        expanded = 0
+        for pref in prefixes:
+            # match stems starting with prefix + '_' or exactly prefix
+            matches = [s for s in audio_stems if s == pref or s.startswith(pref + '_')]
+            labels = self.label_map.get(pref)
+            if not labels or not matches:
+                continue
+            for m in matches:
+                if m not in self.label_map:
+                    self.label_map[m] = labels
+                    expanded += 1
+
+        self.logger.info(f"Expanded prefix labels to {expanded} audio stems")
     
     def _analyze_label_distribution(self):
         """Analyze and log label distribution."""
@@ -1238,6 +1277,10 @@ Examples:
         print(f"\n✗ FATAL ERROR: {e}")
         traceback.print_exc()
         return 1
+
+
+# Backwards-compatible alias for older import paths
+FeatureExtractionManager = FeatureExtractionPipeline
 
 
 if __name__ == '__main__':

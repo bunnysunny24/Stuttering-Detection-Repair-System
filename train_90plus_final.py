@@ -18,6 +18,7 @@ import sys
 import json
 import argparse
 import logging
+import subprocess
 import numpy as np
 import torch
 import torch.nn as nn
@@ -74,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Import models and utilities
 from model_improved_90plus import ImprovedStutteringCNN
 from constants import TOTAL_CHANNELS, NUM_CLASSES, SCHEDULER_PATIENCE, THRESH_SEARCH_START, THRESH_SEARCH_END, THRESH_SEARCH_STEP, THRESHOLD_OPT_EPOCHS, AUG_TIME_MASK_P, AUG_FREQ_MASK_P, AUG_NOISE_P, AUG_STRETCH_P
+from utils import FocalLoss as UtilsFocalLoss
 
 # GPU optimization
 # GPU optimization - MAXIMUM PERFORMANCE
@@ -83,29 +85,8 @@ torch.backends.cudnn.benchmark = True
 os.environ.setdefault('CUDA_LAUNCH_BLOCKING', '0')
 
 
-# ============================================================================
-# FOCAL LOSS (handles extreme imbalance)
-# ============================================================================
-
-class FocalLoss(nn.Module):
-    """Focal Loss for extreme class imbalance."""
-    
-    def __init__(self, alpha=1.0, gamma=2.0, pos_weight=None):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-    
-    def forward(self, predictions, targets):
-        """Focal Loss = alpha * (1 - p_t)^gamma * BCE"""
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            predictions, targets, reduction='none', pos_weight=self.pos_weight
-        )
-        probs = torch.sigmoid(predictions)
-        p_t = torch.where(targets == 1, probs, 1 - probs)
-        focal_weight = (1 - p_t).pow(self.gamma)
-        focal_loss = self.alpha * focal_weight * bce
-        return focal_loss.mean()
+# Use centralized FocalLoss implementation from utils
+# `UtilsFocalLoss` supports `pos_weight` and matches usage below.
 
 
 class LabelSmoothingBCELoss(nn.Module):
@@ -206,19 +187,47 @@ class AudioAugmentation:
     def _time_masking(self, spec):
         """Mask random time region."""
         time_length = spec.shape[1]
-        mask_len = np.random.randint(5, int(time_length * 0.3))
-        mask_start = np.random.randint(0, time_length - mask_len)
+        # Determine mask length robustly for short clips
+        mask_max = max(1, int(time_length * 0.3))
+        mask_min = min(5, mask_max)
+        if mask_min >= mask_max:
+            mask_len = mask_max
+        else:
+            mask_len = np.random.randint(mask_min, mask_max + 1)
+
+        # Choose start position safely
+        start_max = max(0, time_length - mask_len)
+        if start_max <= 0:
+            mask_start = 0
+        else:
+            mask_start = np.random.randint(0, start_max + 1)
+
         spec = spec.copy()
-        spec[:, mask_start:mask_start + mask_len] = np.mean(spec)
+        end = mask_start + mask_len
+        spec[:, mask_start:end] = np.mean(spec)
         return spec
     
     def _freq_masking(self, spec):
         """Mask random frequency band."""
         freq_length = spec.shape[0]
-        mask_len = np.random.randint(5, int(freq_length * 0.2))
-        mask_start = np.random.randint(0, freq_length - mask_len)
+        # Determine mask length robustly for narrow frequency axes
+        mask_max = max(1, int(freq_length * 0.2))
+        mask_min = min(5, mask_max)
+        if mask_min >= mask_max:
+            mask_len = mask_max
+        else:
+            mask_len = np.random.randint(mask_min, mask_max + 1)
+
+        # Choose start position safely
+        start_max = max(0, freq_length - mask_len)
+        if start_max <= 0:
+            mask_start = 0
+        else:
+            mask_start = np.random.randint(0, start_max + 1)
+
         spec = spec.copy()
-        spec[mask_start:mask_start + mask_len, :] = np.mean(spec)
+        end = mask_start + mask_len
+        spec[mask_start:end, :] = np.mean(spec)
         return spec
     
     def _add_noise(self, spec):
@@ -520,7 +529,7 @@ class MetricsTracker:
 class Trainer:
     """Model training with 90+ accuracy optimizations."""
     
-    def __init__(self, model, train_loader, val_loader, device, model_name='improved_90plus', logger=None, training_timestamp=None, early_stop_patience=None, class_weights=None, features_dir='datasets/features', use_ema=False, ema_decay=0.999, use_label_smoothing=False, label_smoothing=0.1, grad_clip=1.0):
+    def __init__(self, model, train_loader, val_loader, device, model_name='improved_90plus', logger=None, training_timestamp=None, early_stop_patience=None, class_weights=None, features_dir='datasets/features', use_ema=False, ema_decay=0.999, use_label_smoothing=False, label_smoothing=0.1, grad_clip=1.0, accumulate_steps=1, sched_patience=None):
         self.model = model.to(device)
         self.device = device
         self.model_name = model_name
@@ -549,12 +558,17 @@ class Trainer:
         )
         
         # Scheduler with warmup
+        patience_val = int(sched_patience) if sched_patience is not None else SCHEDULER_PATIENCE
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='max', factor=0.5, patience=SCHEDULER_PATIENCE
+            self.optimizer, mode='max', factor=0.5, patience=patience_val
         )
         
-        # Mixed precision
-        self.scaler = GradScaler()
+        # Mixed precision: enable only on CUDA
+        self.use_amp = (self.device.type == 'cuda')
+        self.scaler = GradScaler() if self.use_amp else None
+
+        # Gradient accumulation support
+        self.accumulate_steps = int(accumulate_steps) if accumulate_steps and int(accumulate_steps) > 0 else 1
         
         # Metrics
         self.metrics = MetricsTracker()
@@ -578,7 +592,7 @@ class Trainer:
             self.criterion = LabelSmoothingBCELoss(smoothing=self.label_smoothing, pos_weight=self.class_weights)
             print(f"Using LabelSmoothingBCELoss(smoothing={self.label_smoothing})")
         else:
-            self.criterion = FocalLoss(pos_weight=self.class_weights)
+            self.criterion = UtilsFocalLoss(pos_weight=self.class_weights)
         
         # Thresholds - Will be optimized every epoch with smoothing
         self.optimal_thresholds = np.full(NUM_CLASSES, 0.5)
@@ -697,37 +711,54 @@ class Trainer:
         for batch_idx, (X, y) in enumerate(pbar):
             X = X.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
-            
-            self.optimizer.zero_grad()
-            
-            with autocast():
+
+            # Zero grads at accumulation boundaries
+            if (batch_idx % self.accumulate_steps) == 0:
+                self.optimizer.zero_grad()
+
+            with autocast(enabled=self.use_amp):
                 logits = self.model(X)
                 loss = self.criterion(logits, y)
+                # Scale loss by accumulation steps so gradient magnitudes remain consistent
+                loss = loss / float(self.accumulate_steps)
 
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            # Gradient clipping (configurable)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            # Update EMA after optimizer step
-            if self.use_ema and self.ema is not None:
-                try:
-                    self.ema.update()
-                except Exception:
-                    pass
-            
-            total_loss += loss.item()
-            
+            # Backward (AMP if enabled)
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            # Step the optimizer only on accumulation boundary or final batch
+            is_last_step = ((batch_idx + 1) % self.accumulate_steps) == 0 or (batch_idx + 1) == len(self.train_loader)
+            if is_last_step:
+                # Unscale, clip, step and update if using AMP
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+                    self.optimizer.step()
+
+                # Update EMA after optimizer step
+                if self.use_ema and self.ema is not None:
+                    try:
+                        self.ema.update()
+                    except Exception:
+                        pass
+
+            total_loss += (loss.item() * float(self.accumulate_steps))
+
             with torch.no_grad():
                 probs = torch.sigmoid(logits).cpu()
                 y_pred_probs_all.append(probs.numpy())
                 y_pred_binary = (probs.numpy() > self.optimal_thresholds).astype(float)
                 y_pred_binary_all.append(y_pred_binary)
                 y_true_all.append(y.cpu().numpy())
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
+
+            pbar.set_postfix({'loss': f'{(loss.item()*self.accumulate_steps):.4f}'})
+
             # Clear GPU cache every 10 batches
             if batch_idx % 10 == 0 and self.device.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -748,7 +779,7 @@ class Trainer:
         # Get current learning rate
         current_lr = self.optimizer.param_groups[0]['lr']
         
-        print(f"\n[TRAIN EPOCH {epoch+1}]")
+        print(f"[TRAIN EPOCH {epoch+1}]")
         print(f"  Overall: F1={train_f1:.4f}, AUC={train_auc:.4f}, Loss={avg_loss:.4f}, LR={current_lr:.2e}")
         print(f"  Hamming Loss (avg label error): {train_metrics['hamming_loss']:.4f}")
         print(f"  Per-Class Metrics:")
@@ -758,40 +789,14 @@ class Trainer:
         return avg_loss
     
     def validate(self, epoch):
-        """Validate one epoch."""
-        # Use EMA averaged parameters for evaluation if enabled
+        """Validate one epoch (single pass). Uses EMA averaged parameters if enabled."""
+        # Prepare model (use EMA parameters if enabled)
+        ctx = None
         if self.use_ema and self.ema is not None:
             ctx = self.ema.average_parameters()
             ctx.__enter__()
-            try:
-                self.model.eval()
-                total_loss = 0.0
-                y_true_all = []
-                y_pred_probs_all = []
 
-                pbar = tqdm(self.val_loader, desc=f"EPOCH {epoch+1} [VAL]")
-                with torch.no_grad():
-                    for batch_idx, (X, y) in enumerate(pbar):
-                        X = X.to(self.device)
-                        y = y.to(self.device)
-
-                        logits = self.model(X)
-                        loss = self.criterion(logits, y)
-                        total_loss += loss.item()
-
-                        probs = torch.sigmoid(logits).cpu().numpy()
-                        y_pred_probs_all.append(probs)
-                        y_true_all.append(y.cpu().numpy())
-
-                        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-                        # Clear GPU cache every 10 batches
-                        if batch_idx % 10 == 0:
-                            torch.cuda.empty_cache()
-                pbar.close()
-            finally:
-                ctx.__exit__(None, None, None)
-        else:
+        try:
             self.model.eval()
             total_loss = 0.0
             y_true_all = []
@@ -813,40 +818,18 @@ class Trainer:
 
                     pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-                    # Clear GPU cache every 10 batches
-                    if batch_idx % 10 == 0:
+                    # Clear GPU cache every 10 batches (only relevant on CUDA)
+                    if batch_idx % 10 == 0 and self.device.type == 'cuda':
                         torch.cuda.empty_cache()
             pbar.close()
-        total_loss = 0.0
-        
-        y_true_all = []
-        y_pred_probs_all = []
-        
-        pbar = tqdm(self.val_loader, desc=f"EPOCH {epoch+1} [VAL]")
-        with torch.no_grad():
-            for batch_idx, (X, y) in enumerate(pbar):
-                X = X.to(self.device)
-                y = y.to(self.device)
 
-                logits = self.model(X)
-                # Use configured criterion (FocalLoss or LabelSmoothingBCELoss)
-                loss = self.criterion(logits, y)
-                total_loss += loss.item()
+        finally:
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
 
-                probs = torch.sigmoid(logits).cpu().numpy()
-                y_pred_probs_all.append(probs)
-                y_true_all.append(y.cpu().numpy())
-
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-                # Clear GPU cache every 10 batches
-                if batch_idx % 10 == 0:
-                    torch.cuda.empty_cache()
-        pbar.close()
-        
-        avg_loss = total_loss / len(self.val_loader)
-        y_true_array = np.vstack(y_true_all)
-        y_pred_probs_array = np.vstack(y_pred_probs_all)
+        avg_loss = total_loss / len(self.val_loader) if len(self.val_loader) > 0 else float('nan')
+        y_true_array = np.vstack(y_true_all) if len(y_true_all) > 0 else np.zeros((0, NUM_CLASSES))
+        y_pred_probs_array = np.vstack(y_pred_probs_all) if len(y_pred_probs_all) > 0 else np.zeros((0, NUM_CLASSES))
         
         # Threshold optimization: allow more epochs before locking
         if epoch < THRESHOLD_OPT_EPOCHS:
@@ -864,7 +847,7 @@ class Trainer:
         val_f1 = val_metrics['f1_macro']
         
         # Print detailed validation results with per-class metrics
-        print(f"\n[VAL EPOCH {epoch+1}]")
+        print(f"[VAL EPOCH {epoch+1}]")
         print(f"  Overall: F1={val_f1:.4f}, Precision={val_metrics['precision_macro']:.4f}, Recall={val_metrics['recall_macro']:.4f}, ROC_AUC={val_metrics['roc_auc_macro']:.4f}")
         print(f"  Hamming Loss (avg label error): {val_metrics['hamming_loss']:.4f}")
         print(f"  Thresholds: {[f'{t:.3f}' for t in self.optimal_thresholds]}")
@@ -908,7 +891,7 @@ class Trainer:
     
     def train(self, num_epochs):
         """Full training loop."""
-        print("\n=== TRAINING 90+ ACCURACY MODEL ===")
+        print("=== TRAINING 90+ ACCURACY MODEL ===")
         print(f"Model: {self.model_name.upper()}")
         print(f"Epochs: {num_epochs}")
         print(f"Batch size: {len(next(iter(self.train_loader))[0])}")
@@ -941,7 +924,7 @@ class Trainer:
                 print(f"\n✓ Early stopping at epoch {epoch + 1}")
                 break
         
-        print("\n=== TRAINING COMPLETE ===")
+        print("=== TRAINING COMPLETE ===")
         if self.metrics.best_epoch_info:
             info = self.metrics.best_epoch_info
             print(f"Best Model: Epoch {info['epoch']}")
@@ -949,7 +932,8 @@ class Trainer:
             print(f"  Location: Models/checkpoints/{self.model_name}_best.pth")
         else:
             print(f"Best F1: {self.best_f1:.4f}")
-        print('\n')
+        # single blank line separator
+        print()
         
         # Final GPU cleanup
         torch.cuda.empty_cache()
@@ -975,11 +959,22 @@ class DualLogger:
         self.file.flush()
     
     def flush(self):
-        self.console.flush()
-        self.file.flush()
+        try:
+            self.console.flush()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'file') and not self.file.closed:
+                self.file.flush()
+        except Exception:
+            pass
     
     def close(self):
-        self.file.close()
+        try:
+            if hasattr(self, 'file') and not self.file.closed:
+                self.file.close()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -989,15 +984,23 @@ class DualLogger:
 def main():
     parser = argparse.ArgumentParser(description='Train 90+ accuracy stuttering model')
     parser.add_argument('--epochs', type=int, default=60, help='Number of epochs')
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
     parser.add_argument('--data-dir', type=str, default='datasets/features', help='Data directory')
     parser.add_argument('--gpu', action='store_true', default=True, help='Use GPU')
-    parser.add_argument('--num-workers', type=int, default=None, help='Number of DataLoader workers (defaults to CPU count-1)')
+    parser.add_argument('--num-workers', type=int, default=2, help='Number of DataLoader workers (default 2)')
+    parser.add_argument('--omp-threads', type=int, default=4, help='Set OMP_NUM_THREADS / torch.set_num_threads')
     parser.add_argument('--use-ema', action='store_true', help='Enable EMA (Exponential Moving Average) for evaluation')
     parser.add_argument('--ema-decay', type=float, default=0.999, help='EMA decay (default 0.999)')
     parser.add_argument('--use-label-smoothing', action='store_true', help='Use label smoothing BCE loss instead of focal loss')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default 0.1)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Max norm for gradient clipping')
+    parser.add_argument('--oversample', type=str, default='none', choices=['none', 'rare'], help='Oversampling strategy (none, rare)')
+    parser.add_argument('--arch', type=str, default='improved_90plus', choices=['improved_90plus', 'cnn_bilstm'], help='Model architecture to train')
+    parser.add_argument('--auto-calibrate', action='store_true', help='Run threshold calibration automatically after training')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
+    parser.add_argument('--sched-patience', type=int, default=None, help='Scheduler patience for ReduceLROnPlateau (overrides constants.SCHEDULER_PATIENCE)')
+    parser.add_argument('--early-stop', type=int, default=None, help='Early stopping patience (overrides default Trainer setting)')
+    parser.add_argument('--accumulate', type=int, default=1, help='Gradient accumulation steps')
     
     args = parser.parse_args()
     
@@ -1009,17 +1012,35 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     log_file = output_dir / f'training_{training_timestamp}.log'
     sys.stdout = DualLogger(str(log_file))
-    # Reduce noisy INFO logs from libraries during training
-    logging.getLogger().setLevel(logging.WARNING)
+    # Configure logging verbosity
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        print('Verbose logging enabled')
+    else:
+        # Reduce noisy INFO logs from libraries during training
+        logging.getLogger().setLevel(logging.WARNING)
     
     print(f"✓ Training session: {training_timestamp}")
     print(f"✓ Training log: {log_file}")
     print(f"✓ Output folder: {output_dir}")
     device = torch.device('cuda' if (args.gpu and torch.cuda.is_available()) else 'cpu')
     print(f"Device: {device}")
+
+    # Apply threading settings (user-requested)
+    try:
+        os.environ['OMP_NUM_THREADS'] = str(int(args.omp_threads))
+    except Exception:
+        os.environ['OMP_NUM_THREADS'] = '4'
+    try:
+        torch.set_num_threads(int(args.omp_threads))
+    except Exception:
+        pass
+
+    # Print effective runtime settings
+    print(f"Settings: batch_size={args.batch_size}, num_workers={args.num_workers}, omp_threads={os.environ.get('OMP_NUM_THREADS')}")
     
     # Load data
-    print("\nLoading datasets...")
+    print("Loading datasets...")
     train_dataset = AudioDataset(args.data_dir, split='train', augment=True)
     val_dataset = AudioDataset(args.data_dir, split='val', augment=False)
     
@@ -1033,19 +1054,103 @@ def main():
     pin_memory = True if device.type == 'cuda' else False
 
     # Use custom collate to handle variable-length spectrograms or embeddings
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_variable_length)
+    # Optionally use oversampling for rare classes
+    sampler = None
+    if args.oversample == 'rare':
+        # Compute inverse-frequency weights across all classes and assign per-file sample weight
+        # This provides a balanced sampling for multilabel data by upweighting files
+        # that contain rarer classes.
+        print('Computing inverse-frequency sample weights for oversampling...')
+        # Count positives per class
+        class_pos = np.zeros((train_dataset.__len__(),), dtype=np.float32)
+        counts_pos = np.zeros((NUM_CLASSES,), dtype=np.float64)
+        file_labels = []
+        for fidx, f in enumerate(train_dataset.files):
+            try:
+                d = np.load(f)
+                lbl = d.get('labels')
+                if lbl is None:
+                    lbl = np.zeros((NUM_CLASSES,), dtype=np.int32)
+                lbl = np.asarray(lbl)
+                if lbl.size != NUM_CLASSES:
+                    # If stored as integers (label ids), convert to binary presence
+                    lbl = (lbl > 0).astype(np.int32)
+                    if lbl.size < NUM_CLASSES:
+                        # pad or truncate
+                        tmp = np.zeros((NUM_CLASSES,), dtype=np.int32)
+                        tmp[:min(len(lbl), NUM_CLASSES)] = lbl[:min(len(lbl), NUM_CLASSES)]
+                        lbl = tmp
+                else:
+                    lbl = (lbl > 0).astype(np.int32)
+                file_labels.append(lbl)
+                counts_pos += lbl
+            except Exception:
+                file_labels.append(np.zeros((NUM_CLASSES,), dtype=np.int32))
+
+        # avoid div by zero
+        counts_pos = np.maximum(counts_pos, 1.0)
+        inv_freq = (np.sum(counts_pos) / counts_pos)
+        # Normalize inverse frequencies to have mean 1.0
+        inv_freq = inv_freq / np.mean(inv_freq)
+
+        weights = []
+        for lbl in file_labels:
+            # sample weight is average inv_freq of labels present; if none present use 1.0
+            present = lbl.astype(bool)
+            if np.any(present):
+                w = float(np.mean(inv_freq[present]))
+            else:
+                w = 1.0
+            weights.append(max(0.01, w))
+
+        try:
+            from torch.utils.data import WeightedRandomSampler
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+            print('Using WeightedRandomSampler with inverse-frequency weighting')
+        except Exception as e:
+            print('Failed to create WeightedRandomSampler:', e)
+
+    if sampler is not None:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, sampler=sampler, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_variable_length)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_variable_length)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, collate_fn=collate_variable_length)
     
-    # Model
-    model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
-    model_name = 'improved_90plus'
-    
-    print(f"\nModel: ImprovedStutteringCNN (8-layer, 6.5M params)")
+    # Model selection
+    model_name = args.arch
+    if args.arch == 'cnn_bilstm':
+        try:
+            from model_cnn_bilstm import CNNBiLSTM
+            model = CNNBiLSTM(in_channels=123, n_classes=5)
+            print('Using CNN+BiLSTM model')
+        except Exception as e:
+            print('Failed to import CNNBiLSTM, falling back to ImprovedStutteringCNN:', e)
+            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+            model_name = 'improved_90plus'
+    else:
+        model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+        model_name = 'improved_90plus'
+
+    print(f"Model: ImprovedStutteringCNN (8-layer, 6.5M params)")
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Train with training timestamp
-    trainer = Trainer(model, train_loader, val_loader, device, model_name=model_name, training_timestamp=training_timestamp,
-                      use_ema=args.use_ema, ema_decay=args.ema_decay, use_label_smoothing=args.use_label_smoothing, label_smoothing=args.label_smoothing, grad_clip=args.grad_clip)
+    trainer = Trainer(
+        model,
+        train_loader,
+        val_loader,
+        device,
+        model_name=model_name,
+        training_timestamp=training_timestamp,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
+        use_label_smoothing=args.use_label_smoothing,
+        label_smoothing=args.label_smoothing,
+        grad_clip=args.grad_clip,
+        accumulate_steps=args.accumulate,
+        sched_patience=args.sched_patience,
+        early_stop_patience=(args.early_stop if args.early_stop is not None else None),
+    )
     metrics = trainer.train(args.epochs)
     
     # Save metrics in training-specific folder
@@ -1067,6 +1172,23 @@ def main():
     print(f"├─ Metrics file: {metrics_path}")
     print(f"└─ Training log: {log_file}")
     
+    # Optionally run calibration to produce `output/thresholds.json` and lock it
+    if args.auto_calibrate:
+        try:
+            if best_model_path.exists():
+                cmd = [sys.executable, 'Models/calibrate_thresholds.py', '--checkpoint', str(best_model_path), '--data-dir', args.data_dir, '--out', 'output/thresholds.json']
+                print(f"Running calibration: {' '.join(cmd)}")
+                subprocess.run(cmd, check=False)
+                # touch lock file to indicate thresholds set
+                try:
+                    Path('output/thresholds.lock').write_text(datetime.now().isoformat())
+                except Exception:
+                    pass
+            else:
+                print('Best model not found; skipping auto-calibrate')
+        except Exception as e:
+            print('Auto-calibrate failed:', e)
+
     # Close logger
     if isinstance(sys.stdout, DualLogger):
         sys.stdout.close()
