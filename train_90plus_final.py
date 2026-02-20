@@ -74,7 +74,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Import models and utilities
 from model_improved_90plus import ImprovedStutteringCNN
-from constants import TOTAL_CHANNELS, NUM_CLASSES, SCHEDULER_PATIENCE, THRESH_SEARCH_START, THRESH_SEARCH_END, THRESH_SEARCH_STEP, THRESHOLD_OPT_EPOCHS, AUG_TIME_MASK_P, AUG_FREQ_MASK_P, AUG_NOISE_P, AUG_STRETCH_P
+from constants import TOTAL_CHANNELS, NUM_CLASSES, SCHEDULER_PATIENCE, THRESH_SEARCH_START, THRESH_SEARCH_END, THRESH_SEARCH_STEP, THRESHOLD_OPT_EPOCHS, AUG_TIME_MASK_P, AUG_FREQ_MASK_P, AUG_NOISE_P, AUG_STRETCH_P, AUG_PITCH_P, AUG_SNR_P
 from utils import FocalLoss as UtilsFocalLoss
 
 # GPU optimization
@@ -153,8 +153,14 @@ class AudioAugmentation:
     Works with mel-spectrogram and enhanced features.
     """
     
-    def __init__(self, augment_prob=0.5):
+    def __init__(self, augment_prob=0.5, time_mask_p=AUG_TIME_MASK_P, freq_mask_p=AUG_FREQ_MASK_P, noise_p=AUG_NOISE_P, stretch_p=AUG_STRETCH_P, pitch_p=AUG_PITCH_P, snr_p=AUG_SNR_P):
         self.augment_prob = augment_prob
+        self.time_mask_p = float(time_mask_p)
+        self.freq_mask_p = float(freq_mask_p)
+        self.noise_p = float(noise_p)
+        self.stretch_p = float(stretch_p)
+        self.pitch_p = float(pitch_p)
+        self.snr_p = float(snr_p)
     
     def __call__(self, spectrogram):
         """Apply random augmentations."""
@@ -164,10 +170,15 @@ class AudioAugmentation:
     
     def _apply_augmentations(self, spec):
         """Apply one or more augmentations."""
-        augmentation_type = np.random.choice(
-            ['time_mask', 'freq_mask', 'noise', 'stretch'],
-            p=[AUG_TIME_MASK_P, AUG_FREQ_MASK_P, AUG_NOISE_P, AUG_STRETCH_P]
-        )
+        choices = ['time_mask', 'freq_mask', 'noise', 'stretch', 'pitch', 'snr_noise']
+        probs = np.array([self.time_mask_p, self.freq_mask_p, self.noise_p, self.stretch_p, self.pitch_p, self.snr_p], dtype=float)
+        # Normalize probabilities to sum to 1.0 (robust to edits of constants)
+        total = probs.sum()
+        if total <= 0:
+            probs = np.ones_like(probs) / float(len(probs))
+        else:
+            probs = probs / float(total)
+        augmentation_type = np.random.choice(choices, p=probs)
         
         if augmentation_type == 'time_mask':
             # Mask random time segments (simulate speech gaps)
@@ -178,6 +189,10 @@ class AudioAugmentation:
         elif augmentation_type == 'noise':
             # Add gaussian noise
             spec = self._add_noise(spec)
+        elif augmentation_type == 'snr_noise':
+            spec = self._add_noise_snr(spec)
+        elif augmentation_type == 'pitch':
+            spec = self._pitch_shift(spec)
         else:  # stretch
             # Time stretching (simulate faster/slower speech)
             spec = self._time_stretch(spec)
@@ -234,6 +249,34 @@ class AudioAugmentation:
         """Add gaussian noise."""
         noise = np.random.normal(0, 0.01, spec.shape)
         return spec + noise
+
+    def _add_noise_snr(self, spec):
+        """Add gaussian noise scaled to achieve a random SNR between 10 and 30 dB."""
+        # compute signal power
+        power = np.mean(spec ** 2)
+        snr_db = np.random.uniform(10.0, 30.0)
+        snr = 10 ** (snr_db / 10.0)
+        noise_power = power / max(snr, 1e-9)
+        noise = np.random.normal(0, np.sqrt(noise_power), spec.shape)
+        return spec + noise
+
+    def _pitch_shift(self, spec):
+        """Simple pitch shift by rolling frequency axis.
+
+        This is a crude approximation applied on spectrogram bins: shifting
+        up/down by a small number of bins and filling the edge with mean.
+        """
+        max_shift = max(1, int(spec.shape[0] * 0.05))
+        shift = np.random.randint(-max_shift, max_shift + 1)
+        if shift == 0:
+            return spec
+        shifted = np.roll(spec, shift, axis=0)
+        if shift > 0:
+            # filled top rows with mean of original
+            shifted[:shift, :] = np.mean(spec, axis=1)[:shift, None]
+        else:
+            shifted[shift:, :] = np.mean(spec, axis=1)[shift:, None]
+        return shifted
     
     def _time_stretch(self, spec):
         """Time stretching (simple implementation)."""
@@ -307,12 +350,21 @@ def collate_variable_length(batch):
 class AudioDataset(Dataset):
     """Load preprocessed features with augmentation."""
     
-    def __init__(self, data_dir, split='train', augment=True):
+    def __init__(self, data_dir, split='train', augment=True, aug_time_p=None, aug_freq_p=None, aug_noise_p=None, aug_stretch_p=None, aug_pitch_p=None, aug_snr_p=None, augment_prob=0.5):
         self.data_dir = Path(data_dir)
         self.split_dir = self.data_dir / split
         self.files = sorted(self.split_dir.glob('**/*.npz'))
         self.augment = augment and split == 'train'
-        self.augmentation = AudioAugmentation(augment_prob=0.5)
+        # Use provided augmentation probabilities if available, otherwise defaults from constants
+        self.augmentation = AudioAugmentation(
+            augment_prob=augment_prob,
+            time_mask_p=(AUG_TIME_MASK_P if aug_time_p is None else aug_time_p),
+            freq_mask_p=(AUG_FREQ_MASK_P if aug_freq_p is None else aug_freq_p),
+            noise_p=(AUG_NOISE_P if aug_noise_p is None else aug_noise_p),
+            stretch_p=(AUG_STRETCH_P if aug_stretch_p is None else aug_stretch_p),
+            pitch_p=(AUG_PITCH_P if aug_pitch_p is None else aug_pitch_p),
+            snr_p=(AUG_SNR_P if aug_snr_p is None else aug_snr_p),
+        )
         
         if len(self.files) == 0:
             raise ValueError(f"No files found in {self.split_dir}")
@@ -529,9 +581,22 @@ class MetricsTracker:
 class Trainer:
     """Model training with 90+ accuracy optimizations."""
     
-    def __init__(self, model, train_loader, val_loader, device, model_name='improved_90plus', logger=None, training_timestamp=None, early_stop_patience=None, class_weights=None, features_dir='datasets/features', use_ema=False, ema_decay=0.999, use_label_smoothing=False, label_smoothing=0.1, grad_clip=1.0, accumulate_steps=1, sched_patience=None):
+    def __init__(self, model, train_loader, val_loader, device, use_ipex=False, model_name='improved_90plus', logger=None, training_timestamp=None, early_stop_patience=None, class_weights=None, features_dir='datasets/features', use_ema=False, ema_decay=0.999, use_label_smoothing=False, label_smoothing=0.1, grad_clip=1.0, accumulate_steps=1, sched_patience=None, loss_type='focal', learning_rate=1e-4, weight_decay=1e-5, focal_gamma=2.0, scheduler_type='reduce', max_lr=None, seed=None, aug_time_p=None, aug_freq_p=None, aug_noise_p=None, aug_stretch_p=None, aug_pitch_p=None, aug_snr_p=None, save_thresholds=False, thresh_min_precision=0.2, neutral_pos_weight=False):
+        # MixUp strength (alpha) - applied in train_epoch if > 0
+        self.mixup_alpha = float(0.0)
         self.model = model.to(device)
         self.device = device
+        # Determine device type robustly for non-torch-device backends (e.g., DirectML)
+        self.device_type = getattr(device, 'type', None)
+        try:
+            # torch.device has .type
+            if self.device_type is None and isinstance(device, torch.device):
+                self.device_type = device.type
+        except Exception:
+            pass
+        if self.device_type is None:
+            # Default to 'cpu' when unknown
+            self.device_type = 'cpu'
         self.model_name = model_name
         self.logger = logger
         self.train_loader = train_loader
@@ -543,7 +608,23 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Training config
-        self.learning_rate = 1e-4  # Back to original - was working
+        self.learning_rate = float(learning_rate)
+        # Scheduler and seed/config
+        self.focal_gamma = float(focal_gamma)
+        self.scheduler_type = str(scheduler_type)
+        self.max_lr = float(max_lr) if max_lr is not None else None
+        self.save_thresholds = bool(save_thresholds)
+        # Threshold selection guard: require minimum precision when choosing thresholds
+        self.thresh_min_precision = float(thresh_min_precision) if thresh_min_precision is not None else 0.2
+        # If True and oversampling is used, force neutral pos_weight to avoid double-upweighting
+        self.neutral_pos_weight = bool(neutral_pos_weight)
+        # Keep augmentation parameters available for downstream use
+        self.aug_time_p = aug_time_p
+        self.aug_freq_p = aug_freq_p
+        self.aug_noise_p = aug_noise_p
+        self.aug_stretch_p = aug_stretch_p
+        self.aug_pitch_p = aug_pitch_p
+        self.aug_snr_p = aug_snr_p
         # Allow pipeline to override early stop patience
         self.early_stop_patience = early_stop_patience if early_stop_patience is not None else 50
         self.patience_counter = 0
@@ -554,7 +635,7 @@ class Trainer:
         self.optimizer = optim.AdamW(
             model.parameters(),
             lr=self.learning_rate,
-            weight_decay=1e-5
+            weight_decay=float(weight_decay)
         )
         
         # Scheduler with warmup
@@ -562,10 +643,28 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='max', factor=0.5, patience=patience_val
         )
+
+        # Store placeholder for OneCycle/other schedulers - will be configured in train()
+        self._external_scheduler = None
         
         # Mixed precision: enable only on CUDA
-        self.use_amp = (self.device.type == 'cuda')
+        self.use_amp = (self.device_type == 'cuda')
         self.scaler = GradScaler() if self.use_amp else None
+
+        # Optional Intel Extension for PyTorch (IPEX) optimization for CPU
+        self.use_ipex = bool(use_ipex)
+        if self.use_ipex:
+            try:
+                import intel_extension_for_pytorch as ipex
+                try:
+                    # ipex.optimize returns (model, optimizer) when optimizer provided
+                    self.model, self.optimizer = ipex.optimize(self.model, optimizer=self.optimizer)
+                except Exception:
+                    # older/newer versions may have different returns; try safe call
+                    ipex.optimize(self.model)
+                print('Enabled IPEX optimizations for CPU')
+            except Exception as e:
+                print('IPEX not available or failed to initialize:', e)
 
         # Gradient accumulation support
         self.accumulate_steps = int(accumulate_steps) if accumulate_steps and int(accumulate_steps) > 0 else 1
@@ -585,14 +684,30 @@ class Trainer:
         for i, name in enumerate(class_names):
             print(f"  {name:20s}: {self.class_weights[i]:6.3f}")
 
-        # Loss selection: label smoothing or focal
+        # Loss selection: support focal, label-smoothing or BCE
         self.use_label_smoothing = bool(use_label_smoothing)
         self.label_smoothing = float(label_smoothing)
-        if self.use_label_smoothing:
+        self.loss_type = loss_type
+        if self.loss_type == 'bce':
+            # Use BCEWithLogitsLoss; apply pos_weight only if provided (and not neutral)
+            try:
+                if self.class_weights is not None:
+                    self.criterion = torch.nn.BCEWithLogitsLoss(pos_weight=self.class_weights)
+                else:
+                    self.criterion = torch.nn.BCEWithLogitsLoss()
+                print('Using BCEWithLogitsLoss')
+            except Exception:
+                # Fallback
+                self.criterion = torch.nn.BCEWithLogitsLoss()
+        elif self.use_label_smoothing:
             self.criterion = LabelSmoothingBCELoss(smoothing=self.label_smoothing, pos_weight=self.class_weights)
             print(f"Using LabelSmoothingBCELoss(smoothing={self.label_smoothing})")
         else:
-            self.criterion = UtilsFocalLoss(pos_weight=self.class_weights)
+            # Pass focal gamma if provided
+            try:
+                self.criterion = UtilsFocalLoss(gamma=self.focal_gamma, pos_weight=self.class_weights)
+            except Exception:
+                self.criterion = UtilsFocalLoss(pos_weight=self.class_weights)
         
         # Thresholds - Will be optimized every epoch with smoothing
         self.optimal_thresholds = np.full(NUM_CLASSES, 0.5)
@@ -614,6 +729,30 @@ class Trainer:
 
         # Gradient clipping max norm
         self.grad_clip = float(grad_clip)
+        # Ensure mixup attribute exists (may be set by caller)
+        if not hasattr(self, 'mixup_alpha'):
+            self.mixup_alpha = 0.0
+        # Optionally set deterministic behavior if seed provided
+        if seed is not None:
+            try:
+                s = int(seed)
+                import random as _py_random
+                np.random.seed(s)
+                _py_random.seed(s)
+                torch.manual_seed(s)
+                try:
+                    torch.cuda.manual_seed_all(s)
+                except Exception:
+                    pass
+                # enforce deterministic cuDNN for reproducibility (best-effort)
+                try:
+                    torch.backends.cudnn.deterministic = True
+                    torch.backends.cudnn.benchmark = False
+                except Exception:
+                    pass
+                print(f"Set deterministic seed = {s}")
+            except Exception:
+                pass
     
     def optimize_thresholds(self, y_true, y_pred_probs):
         """Find best thresholds for each class - CONSERVATIVE approach with smoothing."""
@@ -630,24 +769,48 @@ class Trainer:
                 optimal_thresholds[class_idx] = self.previous_thresholds[class_idx]
                 continue
             
-            # Search using constants
-            for threshold in np.arange(THRESH_SEARCH_START, THRESH_SEARCH_END, THRESH_SEARCH_STEP):
+            # Search using constants: select threshold that maximizes F1 per-class
+            # Collect candidates that meet minimum precision (if configured)
+            candidates = []
+            best_precision_only = {'precision': -1.0, 'f1': -1.0, 'thresh': best_thresh}
+            for threshold in np.arange(THRESH_SEARCH_START, THRESH_SEARCH_END + 1e-8, THRESH_SEARCH_STEP):
                 y_pred = (y_pred_probs[:, class_idx] > threshold).astype(int)
-                
+
                 # Compute metrics
                 tp = np.sum((y_true_bin == 1) & (y_pred == 1))
                 fp = np.sum((y_true_bin == 0) & (y_pred == 1))
                 fn = np.sum((y_true_bin == 1) & (y_pred == 0))
-                
+
                 precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
                 recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                
-                # FIXED: 50/50 balance (was 80/20)
-                score = (precision * 0.5) + (recall * 0.5)
-                
-                if score > best_score:
-                    best_score = score
-                    best_thresh = threshold
+
+                # Use F1 as the selection metric to balance precision & recall robustly
+                if (precision + recall) > 0:
+                    score = 2.0 * (precision * recall) / (precision + recall)
+                else:
+                    score = 0.0
+
+                # Track best precision-only candidate (used as fallback)
+                if precision > best_precision_only['precision'] or (precision == best_precision_only['precision'] and score > best_precision_only['f1']):
+                    best_precision_only = {'precision': precision, 'f1': score, 'thresh': threshold}
+
+                # If this threshold meets the minimum precision requirement, consider it
+                try:
+                    pmin = float(self.thresh_min_precision)
+                except Exception:
+                    pmin = 0.0
+
+                if precision >= pmin:
+                    candidates.append((score, threshold))
+
+            # Choose best among candidates (by F1). If none meet precision requirement, fall back
+            # to the threshold that maximizes precision (to favor higher thresholds and avoid low-precision picks).
+            if len(candidates) > 0:
+                # pick candidate with highest F1 (score)
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_thresh = candidates[0]
+            else:
+                best_thresh = best_precision_only['thresh']
             
             # SMOOTH thresholds with moving average to prevent oscillation
             # Use exponential decay: 60% new, 40% previous
@@ -699,7 +862,7 @@ class Trainer:
         total_loss = 0.0
         
         # GPU synchronization
-        if self.device.type == 'cuda':
+        if self.device_type == 'cuda':
             torch.cuda.reset_peak_memory_stats()
             torch.cuda.synchronize()
         
@@ -711,6 +874,19 @@ class Trainer:
         for batch_idx, (X, y) in enumerate(pbar):
             X = X.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
+
+            # Optional MixUp augmentation applied on-the-fly
+            if self.mixup_alpha and self.mixup_alpha > 0.0:
+                # sample lambda from Beta distribution
+                lam = np.random.beta(self.mixup_alpha, self.mixup_alpha)
+                if lam < 0.0:
+                    lam = 0.0
+                # shuffle batch
+                idx = torch.randperm(X.size(0))
+                X_shuf = X[idx]
+                y_shuf = y[idx]
+                X = lam * X + (1.0 - lam) * X_shuf
+                y = lam * y + (1.0 - lam) * y_shuf
 
             # Zero grads at accumulation boundaries
             if (batch_idx % self.accumulate_steps) == 0:
@@ -747,6 +923,12 @@ class Trainer:
                         self.ema.update()
                     except Exception:
                         pass
+                # Step external per-batch scheduler (OneCycleLR)
+                if getattr(self, '_step_per_batch', False) and getattr(self, '_external_scheduler', None) is not None:
+                    try:
+                        self._external_scheduler.step()
+                    except Exception:
+                        pass
 
             total_loss += (loss.item() * float(self.accumulate_steps))
 
@@ -760,11 +942,11 @@ class Trainer:
             pbar.set_postfix({'loss': f'{(loss.item()*self.accumulate_steps):.4f}'})
 
             # Clear GPU cache every 10 batches
-            if batch_idx % 10 == 0 and self.device.type == 'cuda':
+            if batch_idx % 10 == 0 and self.device_type == 'cuda':
                 torch.cuda.empty_cache()
         
         # Final GPU sync
-        if self.device.type == 'cuda':
+        if self.device_type == 'cuda':
             torch.cuda.synchronize()
         pbar.close()
         
@@ -819,7 +1001,7 @@ class Trainer:
                     pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
                     # Clear GPU cache every 10 batches (only relevant on CUDA)
-                    if batch_idx % 10 == 0 and self.device.type == 'cuda':
+                    if batch_idx % 10 == 0 and self.device_type == 'cuda':
                         torch.cuda.empty_cache()
             pbar.close()
 
@@ -831,13 +1013,12 @@ class Trainer:
         y_true_array = np.vstack(y_true_all) if len(y_true_all) > 0 else np.zeros((0, NUM_CLASSES))
         y_pred_probs_array = np.vstack(y_pred_probs_all) if len(y_pred_probs_all) > 0 else np.zeros((0, NUM_CLASSES))
         
-        # Threshold optimization: allow more epochs before locking
-        if epoch < THRESHOLD_OPT_EPOCHS:
-            self.optimal_thresholds = self.optimize_thresholds(y_true_array, y_pred_probs_array)
-            print(f"✓ Thresholds (Epoch {epoch+1}): {[f'{t:.3f}' for t in self.optimal_thresholds]}")
-        elif self.thresholds_locked_epoch == -1:
-            self.thresholds_locked_epoch = epoch
-            print(f"🔒 THRESHOLDS LOCKED AT EPOCH {epoch+1}")
+        # Threshold optimization: pick per-class thresholds by maximizing F1.
+        # Do not aggressively lock thresholds early; keep adapting each epoch.
+        self.optimal_thresholds = self.optimize_thresholds(y_true_array, y_pred_probs_array)
+        # Enforce safe bounds to avoid extreme all-positive/all-negative behavior
+        self.optimal_thresholds = np.clip(self.optimal_thresholds, 0.05, 0.95)
+        print(f"✓ Thresholds (Epoch {epoch+1}): {[f'{t:.3f}' for t in self.optimal_thresholds]}")
         
         y_pred_binary_array = (y_pred_probs_array > self.optimal_thresholds).astype(float)
         
@@ -856,6 +1037,15 @@ class Trainer:
             recall_pct = metrics_dict['recall'] * 100
             print(f"    {class_name:18s} | P={metrics_dict['precision']:.3f} R={metrics_dict['recall']:.3f}({recall_pct:.1f}%) F1={metrics_dict['f1']:.3f} AUC={metrics_dict['roc_auc']:.3f} Supp={int(metrics_dict['support'])}")
         
+        # Optionally save optimized thresholds for this epoch
+        if getattr(self, 'save_thresholds', False):
+            try:
+                outp = self.checkpoint_dir / 'optimized_thresholds.json'
+                json.dump({'epoch': epoch + 1, 'thresholds': self.optimal_thresholds.tolist()}, open(outp, 'w'))
+                print(f"Saved optimized thresholds to {outp}")
+            except Exception:
+                pass
+
         # Checkpoints
         if val_f1 > self.best_f1:
             self.best_f1 = val_f1
@@ -872,7 +1062,12 @@ class Trainer:
             self.patience_counter += 1
             self.save_checkpoint(epoch, is_best=False)
         
-        self.scheduler.step(val_f1)
+        # Only step the ReduceLROnPlateau scheduler when using that scheduler
+        if getattr(self, 'scheduler_type', 'reduce') == 'reduce':
+            try:
+                self.scheduler.step(val_f1)
+            except Exception:
+                pass
         
         return avg_loss, val_f1
     
@@ -896,7 +1091,26 @@ class Trainer:
         print(f"Epochs: {num_epochs}")
         print(f"Batch size: {len(next(iter(self.train_loader))[0])}")
         print(f"Start time: {datetime.now().isoformat()}")
-        
+
+        # Configure schedulers that require steps-per-epoch information (OneCycleLR, CosineAnnealing)
+        self.total_epochs = int(num_epochs)
+        self._step_per_batch = False
+        if getattr(self, 'scheduler_type', 'reduce') == 'onecycle':
+            try:
+                steps_per_epoch = max(1, len(self.train_loader))
+                max_lr = self.max_lr if getattr(self, 'max_lr', None) is not None else self.learning_rate
+                self._external_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=max_lr, epochs=self.total_epochs, steps_per_epoch=steps_per_epoch)
+                self._step_per_batch = True
+                print(f"Configured OneCycleLR(max_lr={max_lr}, epochs={self.total_epochs}, steps_per_epoch={steps_per_epoch})")
+            except Exception as e:
+                print('Failed to configure OneCycleLR:', e)
+        elif getattr(self, 'scheduler_type', 'reduce') == 'cosine':
+            try:
+                self._external_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.total_epochs)
+                print(f"Configured CosineAnnealingLR(T_max={self.total_epochs})")
+            except Exception as e:
+                print('Failed to configure CosineAnnealingLR:', e)
+
         for epoch in range(num_epochs):
             train_loss = self.train_epoch(epoch)
             val_loss, val_f1 = self.validate(epoch)
@@ -908,7 +1122,7 @@ class Trainer:
             # Show improvement indicator
             improvement = "↑" if val_f1 > self.best_f1 else "→" 
             
-            print(f"  Summary: Train(F1:{train_metrics['f1_macro']:.3f}) {improvement} Val(F1:{val_f1:.3f}) | Best={self.best_f1:.4f} | Patience={self.patience_counter}/3 | LR={self.optimizer.param_groups[0]['lr']:.2e}")
+            print(f"  Summary: Train(F1:{train_metrics['f1_macro']:.3f}) {improvement} Val(F1:{val_f1:.3f}) | Best={self.best_f1:.4f} | Patience={self.patience_counter}/{self.early_stop_patience} | LR={self.optimizer.param_groups[0]['lr']:.2e}")
             
             # Show class-wise improvements if best
             if val_f1 > self.best_f1:
@@ -987,12 +1201,15 @@ def main():
     parser.add_argument('--batch-size', type=int, default=64, help='Batch size')
     parser.add_argument('--data-dir', type=str, default='datasets/features', help='Data directory')
     parser.add_argument('--gpu', action='store_true', default=True, help='Use GPU')
+    parser.add_argument('--device', type=str, default='auto', choices=['auto', 'cpu', 'cuda', 'dml', 'ipex'], help='Device selection: auto/cpu/cuda/dml(i.e. DirectML)/ipex')
     parser.add_argument('--num-workers', type=int, default=2, help='Number of DataLoader workers (default 2)')
     parser.add_argument('--omp-threads', type=int, default=4, help='Set OMP_NUM_THREADS / torch.set_num_threads')
     parser.add_argument('--use-ema', action='store_true', help='Enable EMA (Exponential Moving Average) for evaluation')
     parser.add_argument('--ema-decay', type=float, default=0.999, help='EMA decay (default 0.999)')
     parser.add_argument('--use-label-smoothing', action='store_true', help='Use label smoothing BCE loss instead of focal loss')
     parser.add_argument('--label-smoothing', type=float, default=0.1, help='Label smoothing factor (default 0.1)')
+    parser.add_argument('--use-bce', action='store_true', help='Use plain BCEWithLogitsLoss (pos_weight applied only if provided)')
+    parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate to pass to model constructors (default 0.2)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Max norm for gradient clipping')
     parser.add_argument('--oversample', type=str, default='none', choices=['none', 'rare'], help='Oversampling strategy (none, rare)')
     parser.add_argument('--arch', type=str, default='improved_90plus', choices=['improved_90plus', 'cnn_bilstm'], help='Model architecture to train')
@@ -1001,6 +1218,25 @@ def main():
     parser.add_argument('--sched-patience', type=int, default=None, help='Scheduler patience for ReduceLROnPlateau (overrides constants.SCHEDULER_PATIENCE)')
     parser.add_argument('--early-stop', type=int, default=None, help='Early stopping patience (overrides default Trainer setting)')
     parser.add_argument('--accumulate', type=int, default=1, help='Gradient accumulation steps')
+    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate for optimizer')
+    parser.add_argument('--weight-decay', type=float, default=1e-5, help='Weight decay for optimizer')
+    parser.add_argument('--mixup-alpha', type=float, default=0.0, help='MixUp alpha; 0 disables MixUp')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for deterministic runs')
+    parser.add_argument('--focal-gamma', type=float, default=2.0, help='Gamma parameter for focal loss')
+    parser.add_argument('--loss-type', type=str, default=None, choices=['focal', 'bce', 'label_smoothing'], help='Loss type to use (overrides --use-bce/--use-label-smoothing)')
+    parser.add_argument('--scheduler', type=str, default='reduce', choices=['reduce', 'onecycle', 'cosine'], help='LR scheduler to use')
+    parser.add_argument('--max-lr', type=float, default=None, help='Max LR for OneCycleLR')
+    # Augmentation overrides
+    parser.add_argument('--aug-time-p', type=float, default=None, help='SpecAugment time-mask probability')
+    parser.add_argument('--aug-freq-p', type=float, default=None, help='SpecAugment freq-mask probability')
+    parser.add_argument('--aug-noise-p', type=float, default=None, help='Additive noise probability')
+    parser.add_argument('--aug-stretch-p', type=float, default=None, help='Time-stretch probability')
+    parser.add_argument('--aug-pitch-p', type=float, default=None, help='Pitch shift probability')
+    parser.add_argument('--aug-snr-p', type=float, default=None, help='SNR noise augmentation probability')
+    parser.add_argument('--save-thresholds', action='store_true', help='Persist optimized thresholds to checkpoint folder each epoch')
+    parser.add_argument('--thresh-min-precision', type=float, default=0.2, help='Minimum per-class precision required when choosing thresholds (0-1)')
+    parser.add_argument('--neutral-pos-weight', action='store_true', help='When oversampling, force neutral pos_weight to avoid double-upweighting')
+    parser.add_argument('--sampler-replacement', action='store_true', help='Use replacement sampling for WeightedRandomSampler when oversampling')
     
     args = parser.parse_args()
     
@@ -1023,8 +1259,34 @@ def main():
     print(f"✓ Training session: {training_timestamp}")
     print(f"✓ Training log: {log_file}")
     print(f"✓ Output folder: {output_dir}")
-    device = torch.device('cuda' if (args.gpu and torch.cuda.is_available()) else 'cpu')
-    print(f"Device: {device}")
+    # Device selection logic (support optional DirectML and IPEX)
+    use_ipex = False
+    use_dml = False
+    device = None
+    if args.device == 'auto':
+        if args.gpu and torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+    elif args.device == 'cuda':
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    elif args.device == 'cpu':
+        device = torch.device('cpu')
+    elif args.device == 'ipex':
+        # Request CPU with IPEX optimization
+        device = torch.device('cpu')
+        use_ipex = True
+    elif args.device == 'dml':
+        # Try to use DirectML device (optional external package)
+        try:
+            import torch_directml
+            device = torch_directml.device()
+            use_dml = True
+        except Exception:
+            print('Warning: torch_directml not available; falling back to CPU')
+            device = torch.device('cpu')
+
+    print(f"Device: {device} (ipex={use_ipex} dml={use_dml})")
 
     # Apply threading settings (user-requested)
     try:
@@ -1041,8 +1303,22 @@ def main():
     
     # Load data
     print("Loading datasets...")
-    train_dataset = AudioDataset(args.data_dir, split='train', augment=True)
-    val_dataset = AudioDataset(args.data_dir, split='val', augment=False)
+    train_dataset = AudioDataset(
+        args.data_dir,
+        split='train',
+        augment=True,
+        aug_time_p=args.aug_time_p,
+        aug_freq_p=args.aug_freq_p,
+        aug_noise_p=args.aug_noise_p,
+        aug_stretch_p=args.aug_stretch_p,
+        aug_pitch_p=args.aug_pitch_p,
+        aug_snr_p=args.aug_snr_p,
+    )
+    val_dataset = AudioDataset(
+        args.data_dir,
+        split='val',
+        augment=False,
+    )
     
     # Configure DataLoader workers and pin_memory
     cpu_count = os.cpu_count() or 1
@@ -1051,7 +1327,7 @@ def main():
     else:
         num_workers = max(0, args.num_workers)
 
-    pin_memory = True if device.type == 'cuda' else False
+    pin_memory = True if getattr(device, 'type', '') == 'cuda' else False
 
     # Use custom collate to handle variable-length spectrograms or embeddings
     # Optionally use oversampling for rare classes
@@ -1105,8 +1381,16 @@ def main():
 
         try:
             from torch.utils.data import WeightedRandomSampler
-            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-            print('Using WeightedRandomSampler with inverse-frequency weighting')
+            # Use weighted sampling; allow replacement when requested via CLI to enable true oversampling
+            try:
+                replacement_flag = bool(args.sampler_replacement)
+            except Exception:
+                replacement_flag = False
+            sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=replacement_flag)
+            if replacement_flag:
+                print('Using WeightedRandomSampler (with replacement) for oversampling')
+            else:
+                print('Using WeightedRandomSampler (no replacement) with inverse-frequency weighting')
         except Exception as e:
             print('Failed to create WeightedRandomSampler:', e)
 
@@ -1121,25 +1405,53 @@ def main():
     if args.arch == 'cnn_bilstm':
         try:
             from model_cnn_bilstm import CNNBiLSTM
-            model = CNNBiLSTM(in_channels=123, n_classes=5)
+            model = CNNBiLSTM(in_channels=123, n_classes=5, dropout=args.dropout)
             print('Using CNN+BiLSTM model')
         except Exception as e:
             print('Failed to import CNNBiLSTM, falling back to ImprovedStutteringCNN:', e)
-            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
             model_name = 'improved_90plus'
     else:
-        model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+        model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
         model_name = 'improved_90plus'
 
-    print(f"Model: ImprovedStutteringCNN (8-layer, 6.5M params)")
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    # Print the selected model name and exact parameter count (avoid hardcoded names)
+    try:
+        param_count = sum(p.numel() for p in model.parameters())
+    except Exception:
+        param_count = 0
+    print(f"Model: {model_name} | Parameters: {param_count:,}")
     
     # Train with training timestamp
+    # If oversampling is enabled, optionally avoid passing aggressive pos_weight to the loss
+    # (oversampling already upweights rare classes). Use neutral class weights only when
+    # the user requests it via --neutral-pos-weight to make this behavior opt-in.
+    class_weights_arg = None
+    try:
+        import numpy as _np
+        import torch as _torch
+        if args.oversample == 'rare' and args.neutral_pos_weight:
+            class_weights_arg = _torch.tensor(_np.ones((NUM_CLASSES,), dtype=_np.float32), dtype=_torch.float32).to(device)
+            print('Oversampling enabled and --neutral-pos-weight set: overriding class pos_weight to neutral to avoid double-upweighting')
+    except Exception:
+        class_weights_arg = None
+
+    # Extra-safe: if we constructed a sampler above, enforce neutral pos_weight only if user opted-in
+    if 'sampler' in locals() and sampler is not None and args.neutral_pos_weight:
+        try:
+            import torch as _torch
+            class_weights_arg = _torch.ones((NUM_CLASSES,), dtype=_torch.float32).to(device)
+            print('Sampler present and --neutral-pos-weight set: enforcing neutral class pos_weight to avoid double-upweighting')
+        except Exception:
+            # If torch not available here for any reason, leave class_weights_arg as-is
+            pass
+
     trainer = Trainer(
         model,
         train_loader,
         val_loader,
         device,
+        use_ipex=use_ipex,
         model_name=model_name,
         training_timestamp=training_timestamp,
         use_ema=args.use_ema,
@@ -1150,7 +1462,31 @@ def main():
         accumulate_steps=args.accumulate,
         sched_patience=args.sched_patience,
         early_stop_patience=(args.early_stop if args.early_stop is not None else None),
+        loss_type=(args.loss_type if args.loss_type is not None else ('bce' if args.use_bce else 'focal')),
+        class_weights=class_weights_arg,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        focal_gamma=args.focal_gamma,
+        scheduler_type=args.scheduler,
+        max_lr=args.max_lr,
+        seed=args.seed,
+        aug_time_p=args.aug_time_p,
+        aug_freq_p=args.aug_freq_p,
+        aug_noise_p=args.aug_noise_p,
+        aug_stretch_p=args.aug_stretch_p,
+        aug_pitch_p=args.aug_pitch_p,
+        aug_snr_p=args.aug_snr_p,
+        save_thresholds=args.save_thresholds,
+        thresh_min_precision=args.thresh_min_precision,
+        neutral_pos_weight=args.neutral_pos_weight,
     )
+    # Apply mixup alpha after trainer initialization to avoid changing signature
+    try:
+        trainer.mixup_alpha = float(args.mixup_alpha)
+        if trainer.mixup_alpha > 0.0:
+            print(f'Enabled MixUp with alpha={trainer.mixup_alpha}')
+    except Exception:
+        trainer.mixup_alpha = 0.0
     metrics = trainer.train(args.epochs)
     
     # Save metrics in training-specific folder

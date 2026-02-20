@@ -8,10 +8,14 @@ AUG_TIME_MASK_P = 0.3
 AUG_FREQ_MASK_P = 0.3
 AUG_NOISE_P = 0.2
 AUG_STRETCH_P = 0.2
+# Additional augmentations
+AUG_PITCH_P = 0.15
+AUG_SNR_P = 0.15
 # Threshold optimization
-THRESH_SEARCH_START = 0.2
-THRESH_SEARCH_END = 0.9
-THRESH_SEARCH_STEP = 0.02
+# Increase lower bound and step to avoid degenerate all-positive threshold picks
+THRESH_SEARCH_START = 0.5
+THRESH_SEARCH_END = 0.95
+THRESH_SEARCH_STEP = 0.05
 # Scheduler and training
 SCHEDULER_PATIENCE = 5
 THRESHOLD_OPT_EPOCHS = 5

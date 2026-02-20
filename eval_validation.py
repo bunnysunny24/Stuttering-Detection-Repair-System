@@ -8,6 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from model_improved_90plus import ImprovedStutteringCNN
+from model_cnn_bilstm import CNNBiLSTM
 from constants import TOTAL_CHANNELS, NUM_CLASSES
 
 
@@ -39,17 +40,39 @@ def main(args):
 
     device = torch.device('cuda' if torch.cuda.is_available() and args.gpu else 'cpu')
 
-    model = ImprovedStutteringCNN(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)
-    state = torch.load(str(ckpt), map_location='cpu')
-    # Support both state dict and wrapped dict
-    if isinstance(state, dict) and 'state_dict' in state:
-        state = state['state_dict']
+    # Load checkpoint and auto-detect model architecture by state_dict keys
+    raw = torch.load(str(ckpt), map_location='cpu')
+    # unwrap common wrappers
+    if isinstance(raw, dict) and 'state_dict' in raw:
+        state = raw['state_dict']
+    else:
+        state = raw if isinstance(raw, dict) else {}
+
+    # strip module prefixes
+    state = {k.replace('module.', ''): v for k, v in state.items()} if isinstance(state, dict) else state
+
+    # heuristics to choose model
+    keys = set(state.keys()) if isinstance(state, dict) else set()
+    use_improved = any(k.startswith('block1.') or k.startswith('attention.') or k.startswith('fc1.') for k in keys)
+    use_cnn_bilstm = any(k.startswith('lstm.') or k.startswith('classifier.') or k.startswith('conv1.') for k in keys)
+
+    if use_cnn_bilstm and not use_improved:
+        print('Detected checkpoint for CNNBiLSTM, loading CNNBiLSTM')
+        model = CNNBiLSTM(in_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)
+    else:
+        print('Defaulting to ImprovedStutteringCNN (detected keys indicate improved or ambiguous)')
+        model = ImprovedStutteringCNN(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)
+
     try:
         model.load_state_dict(state)
-    except Exception:
-        # try tolerant load (strip prefix)
-        new = {k.replace('module.', ''): v for k, v in state.items()}
-        model.load_state_dict(new)
+    except Exception as e:
+        # last-resort: try mapping similar key names (e.g., conv/bn naming differences)
+        new = {k.replace('conv2d', 'conv2').replace('bn2d', 'bn2'): v for k, v in state.items()}
+        try:
+            model.load_state_dict(new)
+        except Exception as e2:
+            print('Failed to load state_dict into chosen model:', e)
+            raise
 
     model.to(device)
     model.eval()
