@@ -1211,7 +1211,7 @@ def main():
     parser.add_argument('--use-bce', action='store_true', help='Use plain BCEWithLogitsLoss (pos_weight applied only if provided)')
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate to pass to model constructors (default 0.2)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Max norm for gradient clipping')
-    parser.add_argument('--oversample', type=str, default='none', choices=['none', 'rare'], help='Oversampling strategy (none, rare)')
+    parser.add_argument('--oversample', type=str, default='none', choices=['none', 'rare', 'weight'], help='Oversampling strategy (none, rare, weight)')
     parser.add_argument('--arch', type=str, default='improved_90plus', choices=['improved_90plus', 'cnn_bilstm'], help='Model architecture to train')
     parser.add_argument('--auto-calibrate', action='store_true', help='Run threshold calibration automatically after training')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
@@ -1237,6 +1237,7 @@ def main():
     parser.add_argument('--thresh-min-precision', type=float, default=0.2, help='Minimum per-class precision required when choosing thresholds (0-1)')
     parser.add_argument('--neutral-pos-weight', action='store_true', help='When oversampling, force neutral pos_weight to avoid double-upweighting')
     parser.add_argument('--sampler-replacement', action='store_true', help='Use replacement sampling for WeightedRandomSampler when oversampling')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to load model weights from (for fine-tuning)')
     
     args = parser.parse_args()
     
@@ -1332,7 +1333,7 @@ def main():
     # Use custom collate to handle variable-length spectrograms or embeddings
     # Optionally use oversampling for rare classes
     sampler = None
-    if args.oversample == 'rare':
+    if args.oversample in ('rare', 'weight'):
         # Compute inverse-frequency weights across all classes and assign per-file sample weight
         # This provides a balanced sampling for multilabel data by upweighting files
         # that contain rarer classes.
@@ -1480,6 +1481,42 @@ def main():
         thresh_min_precision=args.thresh_min_precision,
         neutral_pos_weight=args.neutral_pos_weight,
     )
+    # If user requested to resume/load model weights for fine-tuning, attempt to load before training
+    if args.resume is not None:
+        try:
+            resume_path = Path(args.resume)
+            if resume_path.exists():
+                print(f"Loading checkpoint weights from {resume_path}")
+                state = torch.load(str(resume_path), map_location=device)
+                # Extract state_dict if wrapped in checkpoint dict
+                sd = None
+                if isinstance(state, dict):
+                    if 'state_dict' in state:
+                        sd = state['state_dict']
+                    elif 'model_state' in state:
+                        sd = state['model_state']
+                    elif 'model' in state and isinstance(state['model'], dict):
+                        sd = state['model']
+                    else:
+                        sd = state
+                else:
+                    sd = state
+
+                # Try direct load, or strip 'module.' prefix if necessary
+                try:
+                    trainer.model.load_state_dict(sd)
+                except Exception:
+                    try:
+                        new = {k.replace('module.', ''): v for k, v in sd.items()}
+                        trainer.model.load_state_dict(new)
+                    except Exception as e:
+                        print('Failed to load checkpoint weights:', e)
+                else:
+                    print('Checkpoint weights loaded successfully')
+            else:
+                print(f'Resume checkpoint not found: {resume_path}')
+        except Exception as e:
+            print('Error while loading resume checkpoint:', e)
     # Apply mixup alpha after trainer initialization to avoid changing signature
     try:
         trainer.mixup_alpha = float(args.mixup_alpha)
