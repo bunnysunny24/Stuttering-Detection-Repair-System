@@ -13,106 +13,143 @@ Short project README providing an overview, architecture diagram, end-to-end ins
   - `Models/repair_advanced.py` — detection+repair implementation (vocoder & SciPy fallbacks).
   - `Models/COMPLETE_PIPELINE.py` — end-to-end orchestration (feature extraction, training, evaluation, detect+repair).
 
+  ## Recent updates (Feb 19, 2026)
+
+  - **Goal:** Harden the AGNI pipeline for clinical-trial readiness — robust extraction, stable training, per-class calibration, and reproducible evaluation.
+  - **Preprocessing / Extraction:** `Models/enhanced_audio_preprocessor.py` and `Models/extract_features_90plus.py` were hardened (VAD trimming with amplitude fallback, NaN/Inf sanitization, corrupted-audio staging). Full extraction completed: **31,915** NPZ feature files written (train/val split: ~25,445 / 6,470).
+  - **PyTorch / Env fixes:** Resolved Windows DLL load issues (fbgemm.dll) by switching to a CPU-compatible PyTorch wheel and ensuring required runtimes — `torch` now imported successfully in the `agni` env.
+  - **Training script improvements:** `Models/train_90plus_final.py` patched to add:
+    - Gradient accumulation (`--accumulate`), conditional AMP/GradScaler only on CUDA, EMA support (`--use-ema`), `--omp-threads` and `--num-workers` tuning.
+    - Robust collate/augmentation fixes (mask bounds, padding), guarded logger flush on exit.
+    - Oversampling safety: `WeightedRandomSampler` now sampled without replacement and BCE `pos_weight` is neutralized when `--oversample rare` is used to avoid double-upweighting positives.
+    - CLI flags: `--sched-patience`, `--early-stop`, `--auto-calibrate`, `--verbose`.
+  - **Calibration and evaluation:** `Models/calibrate_thresholds.py` and `Models/eval_validation.py` were patched to auto-detect checkpoint architectures (CNNBiLSTM vs ImprovedStutteringCNN) and produce per-class calibrated thresholds. Calibration wrote `output/thresholds.json` (example thresholds: [0.49, 0.48, 0.5, 0.51, 0.49]).
+  - **Diagnostics added:** `Models/diagnose_best_checkpoint.py` added — computes per-class TP/FP/TN/FN and top false positives/negatives using calibrated thresholds and writes `output/diag_<ckpt>/diagnostics.json`.
+  - **Recent training run (final long run):** command used:
+    ```powershell
+    python Models/train_90plus_final.py --epochs 100 --batch-size 96 --arch cnn_bilstm --oversample rare --auto-calibrate --verbose --num-workers 2 --omp-threads 4 --accumulate 4 --use-ema --sched-patience 5 --early-stop 15
+    ```
+    - Result: early stopped at epoch 16; best checkpoint: `Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth`.
+  - **Evaluation (best CNN-BiLSTM checkpoint):** run `python Models/eval_validation.py --checkpoint Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth --data-dir datasets/features` produced:
+    - Per-class AUCs: [0.6174, 0.6124, 0.6261, 0.6144, 0.6428]
+    - Per-class APs:  [0.3979, 0.5078, 0.3056, 0.2418, 0.4819]
+    - Plots + metrics saved: `output/eval_cnn_bilstm_best/`
+  - **Calibration output:** `output/thresholds.json` (thresholds + per-class F1 summary + temperature for softmax scaling).
+
+  ## Quick diagnostic artifacts (paths)
+
+  - Best checkpoint: `Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth`
+  - Eval metrics + plots: `output/eval_cnn_bilstm_best/`
+  - Calibrated thresholds: `output/thresholds.json`
+  - Diagnostics (TP/FP lists): `output/diag_cnn_bilstm_best/diagnostics.json` (created by `Models/diagnose_best_checkpoint.py`).
+
+  ## Recommended next experiments (priority for PPT/action)
+
+  - A/B training: compare `--oversample none` vs `--oversample rare` (we neutralized pos_weight for rare, but an A/B will confirm precision/recall tradeoffs).
+  - Try `ImprovedStutteringCNN` (higher capacity + attention) on the same data with the improved training defaults.
+  - Conservative loss reweighting: cap per-class `pos_weight` (e.g., ≤3) or use `FocalLoss(gamma=1.0)` to reduce false positives.
+  - Run targeted augmentation and per-class focal tuning for classes with low AP (Sound/Word repetition).
+
+  If you want, I can generate PPT-ready slides (bullet text + suggested visuals) from this section.
+
 ## Architecture Diagram (Mermaid)
 
 ```mermaid
-graph LR
-  A[Raw Audio Files] --> B[Feature Extraction]
-  B --> C[Dataset (NPZ files)]
-  C --> D[ImprovedStutteringCNN]
-  D --> E[Prediction Probabilities]
-  E --> F[Detection Module]
-  F --> G[Repair Module (Spectral Inpainting / Vocoder)]
-  G --> H[Repaired Audio / Analysis JSON]
-  subgraph Training
-    C --> I[Trainer]
-    I --> D
-  end
-```
+*** README: AGNI — Stutter Detection & Repair (project files review) ***
 
-## Model Implementation (where to find code)
+This README now documents only what is implemented in the repository files you asked me to read. It removes references to components not present and summarizes training artifacts produced so far.
 
-- The model class is implemented in `Models/model_improved_90plus.py` as `ImprovedStutteringCNN` (CNN with dropout and final linear classifier producing 5 logits). Use that file as the authoritative implementation.
-- The training utilities, dataset loaders, and loss/metric computation are in `Models/train_90plus_final.py`.
-- Feature extraction (123 channels) lives in `Models/enhanced_audio_preprocessor.py` and `Models/extract_features_90plus.py` — these produce per-clip NPZ files used by the trainer.
+Files used to produce this README:
+- `Models/COMPLETE_PIPELINE.py`
+- `Models/constants.py`
+- `Models/diagnostic_checks.py`
+- `Models/enhanced_audio_preprocessor.py`
+- `Models/extract_features_90plus.py`
+- `Models/extract_features.py`
+- `Models/eval_validation.py`
+- `Models/inspect_val_stats.py`
+- `Models/inspect_probs.py`
+- `Models/repair_advanced.py`
+- `Models/model_improved_90plus.py`
+- `Models/utils.py`
+- `Models/train_90plus_final.py`
 
-## How to reproduce (end-to-end)
+Summary
+-------
+- Purpose: detect stuttering events (5 multi-label classes) from audio features and optionally produce repaired audio using spectral-inpainting/vocoder fallbacks.
+- Feature extractor: `EnhancedAudioPreprocessor` → 123-channel feature stack (mel + MFCC + deltas + spectral features).
+- Model: `ImprovedStutteringCNN` (residual 1D CNN with attention). Input shape: `(batch, 123, time_steps)` → output logits `(batch, 5)`.
+- Training script: `train_90plus_final.py` (data loaders, augmentations, focal/label-smoothing, EMA, threshold optimization, checkpointing).
+- Evaluation: `eval_validation.py` (computes per-class AUC/AP and saves plots + `metrics.json`).
+- Repair: `repair_advanced.py` (uses `EnhancedAudioPreprocessor`; prefers `librosa` but includes SciPy fallbacks already patched).
 
-1. Install dependencies (recommended in a virtualenv):
+What has been trained (current artifacts)
+---------------------------------------
+- Training run completed and checkpointed. Relevant artifacts:
+  - Checkpoints directory: `Models/checkpoints/`
+  - Best checkpoint (from recent run): `Models/checkpoints/training_20260217_013705/improved_90plus_best.pth`
+  - Alternative best build present: `Models/checkpoints/improved_90plus_BEST_OVERALL.pth`
 
-```bash
-python -m venv .venv
-# Windows PowerShell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements_complete.txt
-```
+- Training run details (from logs):
+  - Completed: 60 epochs
+  - Best validation F1: 0.5391
+  - Best validation Precision: 0.4217
+  - Best validation Recall: 0.7706
+  - Validation ROC AUC (aggregate): ~0.7493
 
-2. Extract features (if not already done):
+Validation metrics (from `output/eval_improved_90plus_best/metrics.json`):
 
-```bash
-python Models/extract_features_90plus.py --data-dir datasets/clips --out-dir datasets/features
-```
-
-3. Train the model (example):
-
-```bash
-python Models/train_90plus_final.py --epochs 60 --batch-size 32 --data-dir datasets/features --num-workers 4
-```
-
-4. Evaluate best checkpoint:
-
-```bash
-python Models/eval_validation.py --checkpoint Models/checkpoints/improved_90plus_best.pth --data-dir datasets/features --out-dir output/eval_improved_90plus_best
-```
-
-5. Run detection+repair on a file:
-
-```bash
-python Models/COMPLETE_PIPELINE.py --repair-only --test-file path/to/audio.wav
-```
-
-## Evaluation Results (validation set)
-
-- Per-class AUC: [Prolongation, Block, SoundRep, WordRep, Interjection]
+Per-class AUC and AP (binary labels where label>0 is positive):
 
 ```
-AUC = [0.7663, 0.6678, 0.7695, 0.7177, 0.8251]
-AP  = [0.6242, 0.5634, 0.5410, 0.3741, 0.7837]
+AUC = [0.7663057596, 0.6678425992, 0.7695011562, 0.7176713754, 0.82514403097]
+AP  = [0.6241651300, 0.5634030785, 0.5409565690, 0.3741414754, 0.7837044118]
 ```
 
-These metrics were produced by `Models/eval_validation.py` and saved to `output/eval_improved_90plus_best/metrics.json`.
+Example outputs produced during testing
+--------------------------------------
+- Detection JSON: `output/analysis/WomenWhoStutter_50_0_detection.json`
+- Repaired audio (using SciPy fallback path): `output/repaired_audio/WomenWhoStutter_50_0_repaired.wav`
 
-## Evidence / Proof-of-work
+How to run core commands
+------------------------
+- Evaluate a trained checkpoint (generates plots + `metrics.json`):
 
-- Example detection run saved JSON: `output/analysis/WomenWhoStutter_50_0_detection.json`.
-- Example repaired audio: `output/repaired_audio/WomenWhoStutter_50_0_repaired.wav` (produced with the patched SciPy fallback path).
-
-## Notes & Recommendations
-
-- The repair module uses `librosa` pipelines when available; if `librosa` fails due to `numba`/`numpy` incompatibilities the code now falls back to SciPy-based STFT/ISTFT/resample operations (this is implemented in `Models/repair_advanced.py`).
-- If you prefer the original librosa/numba-based vocoder path, create a fresh virtualenv and install compatible package versions (NumPy ≤ 2.1 and matching numba). I can prepare an environment recipe and test it here if you want.
-
-## Contact / Next steps
-
-- Want a packaged runnable demo? I can create a `run_demo.sh` / `run_demo.ps1` and a minimal web-based audio player to compare original vs repaired outputs.
-- Want the repository documented as a full paper-style README (abstract, methodology, experiments)? I can expand this file.
----
-
-## � TRAINING SESSION SUMMARY (2026-02-13)
-
-### Issues Fixed
-The model was not learning initially (Epoch 1 Val F1 = 0.0000). Applied following fixes:
-
-| Issue | Root Cause | Fix | Result |
-|-------|-----------|-----|--------|
-| **Val F1 = 0** | Learning rate too high (1e-3) | Reduced to **1e-4** | Stable learning ✅ |
-| **No predictions** | Threshold 0.5 too high for weak signals | Lowered to **0.3** | F1 jumped to 0.25 ✅ |
-| **Weak class weights** | Simple formula ignored minority | **Better weighting formula** | Minority classes learned ✅ |
-| **Model arch mismatch** | Repair script used SimpleCNN | Changed to **EnhancedStutteringCNN** | Weights loaded correctly ✅ |
-| **Import errors** | Wrong module paths | Fixed **relative imports** | Scripts run correctly ✅ |
-
-### Hyperparameters (Final Working)
+```powershell
+python Models/eval_validation.py --checkpoint Models/checkpoints/training_20260217_013705/improved_90plus_best.pth --data-dir datasets/features --gpu
 ```
+
+- Run detection+repair on a single file (pipeline auto-detects model if available):
+
+```powershell
+python Models/COMPLETE_PIPELINE.py --repair-only --test-file "path\to\audio.wav" --log-level INFO
+```
+
+Implementation notes (concise)
+----------------------------
+- `Models/model_improved_90plus.py`: Residual 1D conv blocks, attention, global avg+max pooling, two FC layers → logits. Parameter count ~4.7M for 123-channel input.
+- `Models/enhanced_audio_preprocessor.py`: Extracts mel, MFCC, deltas, spectral centroid/rolloff/zcr/flux and stacks into 123 channels. Uses `librosa` if available; SciPy fallbacks implemented.
+- `Models/train_90plus_final.py`: Training logic with FocalLoss/LabelSmoothingBCELoss wrappers, dynamic pos_weight computed from training NPZs, augmentation, EMA support, threshold optimization and checkpoint saving under `Models/checkpoints/`.
+- `Models/repair_advanced.py`: Repair pipeline that first detects regions (model-based or fallback) then applies spectral inpainting and smoothing; uses SciPy fallbacks when `librosa`/`numba` are not compatible.
+
+Diagnostic helpers
+------------------
+- `Models/diagnostic_checks.py`: label mapping, small feature smoke tests, and a model forward-pass test.
+- `Models/inspect_val_stats.py`: counts positive labels in validation NPZs.
+- `Models/inspect_probs.py`: runs model on val NPZs and prints per-class probability stats and computed AUC/AP.
+
+Notes
+-----
+- README now only references files that exist in the repository and summarizes the actual trained artifacts and evaluation outputs produced.
+- I removed references to components not present in the repository. If you want the README to include additional details (full model source, training hyperparameters snapshot, or plots embedded), tell me which and I will add them.
+
+Next actions (pick one)
+----------------------
+1) Add the full `ImprovedStutteringCNN` code inline in README for quick offline reading.
+2) Create `run_demo.ps1` to run detection+repair on a chosen file and print output locations.
+3) Create a reproducible virtualenv here and attempt to install compatible `librosa`/`numba` to enable the original vocoder path and re-run repair.
+
+Tell me which next action to take and I'll proceed.
 Model: EnhancedStutteringCNN
   - 7 layers (with residual + attention)
   - 3.998M parameters
@@ -401,6 +438,105 @@ The preprocessing script does the following:
 
 ### Why Preprocess First?
 
+
+## Implementation Details (Architectures & Scripts)
+
+This section summarizes the main model architectures, training loop, preprocessing, extraction, evaluation, calibration, and repair scripts implemented in the repository. Use this as source content for PPT slides.
+
+- **Model: ImprovedStutteringCNN (Models/model_improved_90plus.py)**
+  - Type: 1D Residual CNN with channel attention
+  - Depth: 8 residual blocks (mix of stride-1 and stride-2 for downsampling)
+  - Channels: starts from input 123 → 64 → 128 → 256 → 512 → ... → 128
+  - Pooling: global avg + max pooled and concatenated (feature dimension 128*2)
+  - Head: FC(256->64) + ReLU + Dropout + FC(64->5) → logits for 5 classes
+  - Regularization: dropout (default 0.4), BatchNorm after convs, residual connections
+  - Attention: lightweight channel attention (two FC layers + sigmoid)
+
+- **Model: CNNBiLSTM (Models/model_cnn_bilstm.py)**
+  - Type: shallow 1D Conv encoder + bidirectional LSTM
+  - Encoder: two Conv1d layers (in->128->128) + BN + ReLU
+  - LSTM: BiLSTM with hidden_size default 256 (returns sequence)
+  - Pooling: mean-pool LSTM outputs over time
+  - Head: Linear(hidden*2 -> 256) + ReLU + Dropout + Linear(256 -> 5)
+  - Good for prototyping / faster runs; lower capacity than ImprovedStutteringCNN
+
+- **Feature extractor: EnhancedAudioPreprocessor (Models/enhanced_audio_preprocessor.py)**
+  - Outputs: 123-channel feature stack: 80 mel + 13 MFCC + 13 delta + 13 delta-delta + 4 spectral features
+  - Robustness: VAD trimming with amplitude fallback, NaN/Inf sanitization, librosa guard + SciPy fallbacks
+  - Quality checks: per-file SNR estimation, silent-channel detection, feature stats collection
+
+- **Extraction orchestrator: Models/extract_features_90plus.py**
+  - Batch extraction with checkpointing, detailed logging, memory & timing diagnostics
+  - Moves corrupted audio to `datasets/corrupted_audio/` and saves NPZs under `datasets/features/{train,val}`
+
+- **Training: Models/train_90plus_final.py**
+  - Features:
+    - Supports 123-channel inputs and 2 model choices (`ImprovedStutteringCNN` or `CNNBiLSTM` via CLI `--arch`)
+    - Augmentations: time/freq masking, noise, time-stretch (robust bounds)
+    - Collate handles variable-length inputs and pads to max length in batch
+    - Mixed precision: `autocast` + `GradScaler` only enabled on CUDA
+    - Gradient accumulation (`--accumulate`), EMA (`--use-ema`), LR scheduler (ReduceLROnPlateau)
+    - Loss: FocalLoss with optional pos_weight OR LabelSmoothingBCELoss
+    - Oversampling: `--oversample rare` uses WeightedRandomSampler (now without replacement) and neutralizes pos_weight to avoid double-upweighting positives
+    - Threshold optimization per epoch and lock/temperature support for calibration
+  - Outputs: checkpoints under `Models/checkpoints/training_<timestamp>/`, metrics JSON and logs under `output/`.
+
+- **Calibration: Models/calibrate_thresholds.py**
+  - Loads checkpoint (auto-detects model class by inspecting keys), gathers logits on validation set, optionally optimizes a single temperature scalar, then searches per-class thresholds to maximize F1.
+  - Output: `output/thresholds.json` with thresholds, per-class F1 metrics, and temperature.
+
+- **Evaluation: Models/eval_validation.py**
+  - Loads a checkpoint (auto-detects model), runs model on validated NPZs, computes per-class AUC and AP, saves histograms, ROC and PR plots to `output/eval_<ckpt>/` and `metrics.json`.
+
+- **Diagnostics: Models/diagnose_best_checkpoint.py**
+  - Uses calibrated thresholds to compute per-class TP/FP/TN/FN and writes `output/diag_<ckpt>/diagnostics.json` with top false-positive and false-negative examples.
+
+- **Repair: Models/repair_advanced.py**
+  - Detect → map → repair flow: runs model detection, uses Whisper ASR for word timestamps, maps detections to words, applies repair (attenuate/silence/remove) with vocoder/SciPy fallbacks.
+  - Conservative repair rules: require per-class threshold + minimum detected region duration (default 0.2s) to avoid over-repairing.
+
+- **Utilities: Models/utils.py**
+  - `FocalLoss` implementation with pos_weight support
+  - Metric helpers and epoch diagnostics saver
+
+## How to reproduce main steps (copyable)
+
+- Extract features (one-time):
+```powershell
+python Models/extract_features_90plus.py --output datasets/features --log-level INFO
+```
+
+- Train (example, CNNBiLSTM run used in recent experiments):
+```powershell
+python Models/train_90plus_final.py --epochs 100 --batch-size 96 --arch cnn_bilstm --oversample rare --auto-calibrate --verbose --num-workers 2 --omp-threads 4 --accumulate 4 --use-ema --sched-patience 5 --early-stop 15
+```
+
+- Calibrate thresholds (explicitly):
+```powershell
+python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features --out output/thresholds.json
+```
+
+- Evaluate checkpoint:
+```powershell
+python Models/eval_validation.py --checkpoint Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features
+```
+
+- Diagnostics (apply calibrated thresholds and list top FP/FN):
+```powershell
+python Models/diagnose_best_checkpoint.py --ckpt Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features --thresholds output/thresholds.json
+```
+
+## Notes, caveats & recommendations
+
+- Environment: prefer a Conda environment on Windows due to librosa/numba/NumPy compatibility (see `requirements_complete.txt`). CPU PyTorch wheel was used in the final runs to avoid DLL issues.
+- If AUC/AP are low for some classes (as seen in the CNNBiLSTM run), try:
+  - A/B test oversampling vs no-oversampling (`--oversample none`) and compare precision/recall.
+  - Train `ImprovedStutteringCNN` for more capacity + attention.
+  - Cap pos_weight when not oversampling (e.g., clip to ≤3) or use `FocalLoss(gamma=1.0)` to reduce false positives.
+  - Tune thresholds using `Models/calibrate_thresholds.py` and use the produced `output/thresholds.json` for inference/repair.
+
+---
+
 - **Speed:** Extracting spectrograms on-the-fly during training is slow (~2x slower)
 - **Consistency:** All samples use same preprocessing (reproducible results)
 - **Memory:** Features cached on disk, only loaded during training batches
@@ -541,6 +677,33 @@ python Models/run_asr_map_repair.py --model_path <best_checkpoint> --input_file 
 ```
 
 If you want, I can commit these steps into a `scripts/run_full_pipeline.sh` (or PowerShell) to automate the sequence — tell me "create run script" and I'll add it.
+
+## **Assistant Updates (2026-02-18)**
+
+- **Files added or modified by the assistant:**
+  - `Models/calibrate_thresholds.py` — new script to sweep per-class decision thresholds on the validation set and write `output/thresholds.json`.
+  - `Models/model_cnn_bilstm.py` — CNN → BiLSTM prototype model added for temporal experiments (selectable via `--arch cnn_bilstm`).
+  - `Models/augment_repetitions.py` — augmentation helper to synthesize repeated-word examples for the rare `Word Repetition` class.
+  - `Models/repair_advanced.py` — patched to include a `librosa` guard and SciPy fallbacks, to load `output/thresholds.json` if present, and to apply a conservative per-class threshold + minimum-duration (default 0.2s) before performing repairs.
+  - `Models/train_90plus_final.py` — added `--arch` and `--oversample` flags and sampler support for rare-class oversampling.
+  - `Models/COMPLETE_PIPELINE.py` — reduced import noise and wired repair to honor the thresholds file when available.
+
+- **Behavior & usage notes:**
+  - Calibration produces `output/thresholds.json`. Run calibration with:
+
+    ```powershell
+    python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/training_20260217_013705/improved_90plus_best.pth --data-dir datasets/features --output output/thresholds.json
+    ```
+
+  - The repair module now uses conservative rules: a detection must exceed its per-class threshold (from `output/thresholds.json`) and the detected region must be at least 0.2s long before repair is attempted. This reduces over-repairing.
+
+  - To run detection+repair using the calibrated thresholds (pipeline will auto-detect `output/thresholds.json` if present):
+
+    ```powershell
+    python Models/COMPLETE_PIPELINE.py --repair-only --test-file "path\to\audio.mp3" --threshold-file output/thresholds.json --mode attenuate
+    ```
+
+  - These edits were implemented to keep the pipeline functional without changing the host environment (SciPy fallbacks used when `librosa`/`numba` are incompatible).
 
 ## 📊 REPAIR MODES (Choose One)
 

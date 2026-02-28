@@ -1,0 +1,95 @@
+# ============================================================================
+# STUTTERING DETECTION & REPAIR SYSTEM - COMPLETE REQUIREMENTS
+# ============================================================================
+# 
+# SETUP OPTIONS:
+# 
+# 1. CPU ONLY (Recommended for ThinkPad T14 Gen 2i with i7):
+#    python -m venv .venv_models
+#    .venv_models\Scripts\Activate.ps1
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+#    pip install -r requirements_complete.txt
+#
+# 2. NVIDIA GPU (CUDA 11.8 - RTX 3000/4000 series):
+#    python -m venv .venv_models
+#    .venv_models\Scripts\Activate.ps1
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#    pip install -r requirements_complete.txt
+#
+# 3. NVIDIA GPU (CUDA 12.1 - RTX 4090/RTX 5000/Latest):
+#    python -m venv .venv_models
+#    .venv_models\Scripts\Activate.ps1
+#    pip install torch torchvision torchaudio
+#    pip install -r requirements_complete.txt
+#
+# 4. AMD GPU (ROCm 5.7 - Radeon RX 6000/7000):
+#    python -m venv .venv_models
+#    .venv_models\Scripts\Activate.ps1
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+#    pip install -r requirements_complete.txt
+#
+# 5. APPLE SILICON (M1/M2/M3 Mac):
+#    python -m venv .venv_models
+#    source .venv_models/bin/activate
+#    pip install torch torchvision torchaudio
+#    pip install -r requirements_complete.txt
+#
+# ============================================================================
+
+# ────────────────────────────────────────────────────────────────────────
+# PYTORCH FRAMEWORK (CHOOSE ONE INSTALLATION METHOD ABOVE!)
+# ────────────────────────────────────────────────────────────────────────
+# 
+# PyTorch versions available:
+# STUTTERING DETECTION & REPAIR - FINAL REQUIREMENTS (Python 3.11+ friendly)
+# This file contains the non-PyTorch deps. Install PyTorch separately
+# as described in the repository README or instructions above.
+
+# Core numerical & signal processing (conservative range to avoid
+# numba/librosa/NumPy ABI mismatches on Windows + Python 3.11)
+numpy>=1.24,<2.3
+scipy>=1.10.1
+pandas>=1.5.3
+scikit-learn>=1.2.2
+
+# Audio processing
+librosa==0.9.2         # stable, known-good with numpy<2.3; if you need newer
+                       # librosa features on Windows consider using a conda env
+soundfile==0.12.1
+openai-whisper>=20250625
+faster-whisper>=0.10.0
+
+# Transformers & training helpers (install PyTorch first)
+transformers>=4.30.0
+accelerate>=0.21.0
+peft==0.7.1
+
+# Tokenizers
+sentencepiece>=0.1.98
+tokenizers>=0.13.3
+
+# Utilities
+tqdm>=4.65.0
+matplotlib>=3.7.0
+jiwer>=2.4.0
+ctc-segmentation>=1.6.0
+
+# Web / serving (optional)
+fastapi>=0.95.0
+uvicorn[standard]>=0.22.0
+python-multipart>=0.0.6
+
+# Testing
+pytest>=7.2.0
+
+# Dataset & helpers
+datasets==2.18.0
+
+# Notes:
+# - If you see build errors for numba or librosa on Windows, prefer creating
+#   a conda environment and installing binary packages: `conda install -c conda-forge numba librosa`
+# - Do NOT install PyTorch from this file; follow the platform-specific
+#   instructions in the README (choose CPU/GPU wheel first), then:
+#       pip install -r requirements_complete.txt
+
+# End of file
