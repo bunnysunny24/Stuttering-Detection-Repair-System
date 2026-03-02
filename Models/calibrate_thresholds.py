@@ -15,8 +15,8 @@ def load_model(checkpoint_path, device):
     state = torch.load(str(checkpoint_path), map_location=device)
 
     # If common encapsulation was used (e.g., {'state_dict': ...}), unwrap it
-    if isinstance(state, dict) and ('state_dict' in state or 'model_state_dict' in state):
-        state = state.get('state_dict', state.get('model_state_dict'))
+    if isinstance(state, dict) and ('state_dict' in state or 'model_state_dict' in state or 'model_state' in state):
+        state = state.get('state_dict', state.get('model_state_dict', state.get('model_state')))
 
     # Strip common DataParallel/module. prefix if present
     def _strip_module_prefix(d):
@@ -30,38 +30,77 @@ def load_model(checkpoint_path, device):
 
     # Heuristic detection based on keys
     keys = list(state.keys()) if isinstance(state, dict) else []
+    # Detect model architecture from state dict keys
+    use_large = any(k.startswith('ms_conv1.') for k in keys)  # ms_conv1 is unique to ImprovedStutteringCNNLarge
     use_improved = any(k.startswith('block1.') for k in keys)
     use_cnn_bilstm = any(k.startswith('conv1') or k.startswith('lstm') or k.startswith('classifier') for k in keys)
+    use_embedding_mlp = any(k.startswith('input_bn.') or k.startswith('backbone.') for k in keys)
+    use_temporal_w2v = any(k.startswith('proj.') and any(k2.startswith('temporal_blocks.') for k2 in keys) for k in keys)
+    use_temporal_bilstm = any(k.startswith('lstm_norm.') and any(k2.startswith('temporal_blocks.') for k2 in keys) for k in keys)
 
+    # Try all model classes in order of likelihood
+    candidates = []
+    if use_temporal_bilstm:
+        _input_dim = 768
+        for k, v in state.items():
+            if k == 'proj.0.weight':
+                _input_dim = v.shape[1]
+                break
+        candidates.append(('model_temporal_bilstm', 'TemporalBiLSTMClassifier', {'input_dim': _input_dim, 'n_classes': 5, 'hidden_dim': 256, 'lstm_hidden': 128, 'lstm_layers': 2, 'dropout': 0.3}))
+    if use_temporal_w2v and not use_temporal_bilstm:
+        # Detect input_dim from projection layer
+        _input_dim = 768
+        for k, v in state.items():
+            if k == 'proj.0.weight':  # Conv1d weight shape: (out, in, kernel)
+                _input_dim = v.shape[1]
+                break
+        candidates.append(('model_temporal_w2v', 'TemporalStutterClassifier', {'input_dim': _input_dim, 'n_classes': 5, 'hidden_dim': 256, 'dropout': 0.3}))
+    if use_embedding_mlp:
+        # Detect input_dim from the first linear layer weight shape
+        _emb_dim = 1536
+        for k, v in state.items():
+            if k == 'backbone.0.fc.weight':
+                _emb_dim = v.shape[1]
+                break
+            elif k == 'input_bn.weight':
+                _emb_dim = v.shape[0]
+                break
+        candidates.append(('model_embedding_mlp', 'EmbeddingMLPClassifier', {'input_dim': _emb_dim, 'n_classes': 5, 'dropout': 0.3}))
+    if use_large:
+        candidates.append(('model_improved_90plus_large', 'ImprovedStutteringCNNLarge', {'n_channels': 123, 'n_classes': 5, 'dropout': 0.35}))
     if use_improved:
-        from model_improved_90plus import ImprovedStutteringCNN
-        model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+        candidates.append(('model_improved_90plus', 'ImprovedStutteringCNN', {'n_channels': 123, 'n_classes': 5, 'dropout': 0.4}))
+    if use_cnn_bilstm:
+        candidates.append(('model_cnn_bilstm', 'CNNBiLSTM', {'in_channels': 123, 'n_classes': 5}))
+    # Always add all as fallbacks
+    candidates.extend([
+        ('model_improved_90plus_large', 'ImprovedStutteringCNNLarge', {'n_channels': 123, 'n_classes': 5, 'dropout': 0.35}),
+        ('model_improved_90plus', 'ImprovedStutteringCNN', {'n_channels': 123, 'n_classes': 5, 'dropout': 0.4}),
+        ('model_cnn_bilstm', 'CNNBiLSTM', {'in_channels': 123, 'n_classes': 5}),
+    ])
+
+    model = None
+    for mod_name, cls_name, kwargs in candidates:
         try:
-            model.load_state_dict(state)
-            print('Loaded checkpoint as ImprovedStutteringCNN')
+            mod = __import__(mod_name)
+            ModelClass = getattr(mod, cls_name)
+            m = ModelClass(**kwargs)
+            m.load_state_dict(state)
+            model = m
+            print(f'Loaded checkpoint as {cls_name}')
+            break
         except Exception:
-            # try fallback
-            pass
-    elif use_cnn_bilstm:
-        from model_cnn_bilstm import CNNBiLSTM
-        model = CNNBiLSTM(in_channels=123, n_classes=5)
-        try:
-            model.load_state_dict(state)
-            print('Loaded checkpoint as CNNBiLSTM')
-        except Exception:
-            pass
-    else:
-        # As a final fallback, try both model classes
-        from model_improved_90plus import ImprovedStutteringCNN
-        from model_cnn_bilstm import CNNBiLSTM
-        model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
-        try:
-            model.load_state_dict(state)
-            print('Fallback: loaded as ImprovedStutteringCNN')
-        except Exception:
-            model = CNNBiLSTM(in_channels=123, n_classes=5)
-            model.load_state_dict(state)
-            print('Fallback: loaded as CNNBiLSTM')
+            try:
+                stripped = {k.replace('module.', ''): v for k, v in state.items()}
+                m.load_state_dict(stripped)
+                model = m
+                print(f'Loaded checkpoint as {cls_name} (stripped keys)')
+                break
+            except Exception:
+                continue
+
+    if model is None:
+        raise RuntimeError('Could not load checkpoint with any known model class')
 
     model.to(device).eval()
     return model

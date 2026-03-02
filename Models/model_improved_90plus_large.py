@@ -156,7 +156,7 @@ class ImprovedStutteringCNNLarge(nn.Module):
 
         # Project to d_model for Transformer
         self.proj_to_dmodel = nn.Conv1d(320, d_model, kernel_size=1)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=d_model * 2, dropout=dropout, activation='relu')
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=d_model * 2, dropout=dropout, activation='relu', batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
 
         # Attentive pooling
@@ -191,11 +191,11 @@ class ImprovedStutteringCNNLarge(nn.Module):
 
         x = self.attention(x)
 
-        # Transformer expects (T, B, D)
+        # Transformer expects (B, T, D) with batch_first=True
         x_t = self.proj_to_dmodel(x)  # (B, d_model, T)
-        x_t = x_t.permute(2, 0, 1)  # (T, B, d_model)
-        x_t = self.transformer(x_t)  # (T, B, d_model)
-        x_t = x_t.permute(1, 2, 0)  # (B, d_model, T)
+        x_t = x_t.permute(0, 2, 1)  # (B, T, d_model)
+        x_t = self.transformer(x_t)  # (B, T, d_model)
+        x_t = x_t.permute(0, 2, 1)  # (B, d_model, T)
 
         pooled = self.pool(x_t)  # (B, d_model)
 

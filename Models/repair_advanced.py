@@ -24,6 +24,12 @@ Usage:
     repaired_audio, segments = repair.repair_audio('input.wav')
 """
 
+import os
+# Workaround: allow duplicate OpenMP runtime to avoid libiomp5md.dll initialization error
+# This is an unsafe workaround but prevents immediate crash when multiple OpenMP runtimes
+# are loaded (e.g., MKL + Intel OpenMP). Prefer resolving conflicting libraries long-term.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import numpy as np
 import soundfile as sf
 from pathlib import Path
@@ -121,22 +127,63 @@ class AdvancedStutteringRepair:
     def _load_model(self, model_path):
         """FIXED: Load trained stuttering detection model with correct parameters."""
         try:
-            from model_improved_90plus import ImprovedStutteringCNN
-            
-            # FIXED: Initialize with correct channel count
-            self.model = ImprovedStutteringCNN(
-                n_channels=self.TOTAL_CHANNELS,
-                n_classes=5,
-                dropout=0.4
-            ).to(self.device)
-            
-            # Load weights
+            # Try multiple model classes to maximize compatibility with different checkpoints
+            tried = []
+            loaded = False
             state_dict = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(state_dict)
-            self.model.eval()
-            
-            print(f"✓ Loaded detection model from {model_path}")
-            print(f"  Model expects {self.TOTAL_CHANNELS} feature channels")
+            # Candidate model constructors (module, class)
+            candidates = [
+                ('model_improved_90plus_large', 'ImprovedStutteringCNNLarge'),
+                ('model_improved_90plus', 'ImprovedStutteringCNN'),
+                ('model_improved_90plus_se', 'ImprovedStutteringCNNLargeSE'),
+                ('model_improved_90plus_se', 'ImprovedStutteringCNNSE'),
+            ]
+            for mod_name, cls_name in candidates:
+                try:
+                    mod = __import__(mod_name)
+                    ModelClass = getattr(mod, cls_name)
+                    model = ModelClass(n_channels=self.TOTAL_CHANNELS, n_classes=5, dropout=0.4)
+                    try:
+                        model.load_state_dict(state_dict)
+                        self.model = model.to(self.device)
+                        self.model.eval()
+                        loaded = True
+                        print(f"✓ Loaded detection model using {mod_name}.{cls_name} from {model_path}")
+                        break
+                    except Exception:
+                        # try stripping 'module.' prefixes
+                        try:
+                            stripped = {k.replace('module.', ''): v for k, v in state_dict.items()}
+                            model.load_state_dict(stripped)
+                            self.model = model.to(self.device)
+                            self.model.eval()
+                            loaded = True
+                            print(f"✓ Loaded detection model using {mod_name}.{cls_name} (stripped keys) from {model_path}")
+                            break
+                        except Exception:
+                            tried.append(f"{mod_name}.{cls_name}")
+                            continue
+                except Exception:
+                    tried.append(f"{mod_name}.{cls_name}")
+                    continue
+
+            if not loaded:
+                print(f"Warning: failed to load model with candidates: {tried}")
+                # As a last resort, attempt to load state into a generic ImprovedStutteringCNN if available
+                try:
+                    from model_improved_90plus import ImprovedStutteringCNN
+                    self.model = ImprovedStutteringCNN(n_channels=self.TOTAL_CHANNELS, n_classes=5, dropout=0.4).to(self.device)
+                    try:
+                        self.model.load_state_dict(state_dict)
+                        self.model.eval()
+                        print(f"✓ Loaded detection model using fallback ImprovedStutteringCNN from {model_path}")
+                        loaded = True
+                    except Exception:
+                        print('Fallback load failed: state dict incompatible')
+                except Exception:
+                    pass
+            if not loaded:
+                raise RuntimeError('Could not load model from checkpoint with available model classes')
             
         except Exception as e:
             print(f"⚠ Could not load model: {e}")

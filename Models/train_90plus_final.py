@@ -25,6 +25,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
+from contextlib import nullcontext
+try:
+    from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
+except Exception:
+    AveragedModel = None
+    SWALR = None
+    update_bn = None
 from pathlib import Path
 from datetime import datetime
 import pickle
@@ -169,33 +176,31 @@ class AudioAugmentation:
         return spectrogram
     
     def _apply_augmentations(self, spec):
-        """Apply one or more augmentations."""
-        choices = ['time_mask', 'freq_mask', 'noise', 'stretch', 'pitch', 'snr_noise']
-        probs = np.array([self.time_mask_p, self.freq_mask_p, self.noise_p, self.stretch_p, self.pitch_p, self.snr_p], dtype=float)
-        # Normalize probabilities to sum to 1.0 (robust to edits of constants)
-        total = probs.sum()
-        if total <= 0:
-            probs = np.ones_like(probs) / float(len(probs))
-        else:
-            probs = probs / float(total)
-        augmentation_type = np.random.choice(choices, p=probs)
+        """Apply MULTIPLE augmentations (compose 1-3 randomly).
         
-        if augmentation_type == 'time_mask':
-            # Mask random time segments (simulate speech gaps)
-            spec = self._time_masking(spec)
-        elif augmentation_type == 'freq_mask':
-            # Mask random frequency bands
-            spec = self._freq_masking(spec)
-        elif augmentation_type == 'noise':
-            # Add gaussian noise
-            spec = self._add_noise(spec)
-        elif augmentation_type == 'snr_noise':
-            spec = self._add_noise_snr(spec)
-        elif augmentation_type == 'pitch':
-            spec = self._pitch_shift(spec)
-        else:  # stretch
-            # Time stretching (simulate faster/slower speech)
-            spec = self._time_stretch(spec)
+        Composing augmentations is far more effective than applying just one.
+        Each augmentation is applied independently with its own probability.
+        """
+        aug_map = {
+            'time_mask': (self.time_mask_p, self._time_masking),
+            'freq_mask': (self.freq_mask_p, self._freq_masking),
+            'noise': (self.noise_p, self._add_noise),
+            'snr_noise': (self.snr_p, self._add_noise_snr),
+            'pitch': (self.pitch_p, self._pitch_shift),
+            'stretch': (self.stretch_p, self._time_stretch),
+        }
+        
+        # Normalize probabilities to reasonable per-augmentation application rates
+        total = sum(p for p, _ in aug_map.values())
+        if total <= 0:
+            return spec
+        
+        # Each augmentation is independently applied with its own probability
+        for name, (prob, fn) in aug_map.items():
+            # Scale probability so the expected number of augmentations is ~2
+            apply_prob = min(0.6, prob / total)
+            if np.random.random() < apply_prob:
+                spec = fn(spec)
         
         return spec
     
@@ -389,12 +394,37 @@ class AudioDataset(Dataset):
                 raise RuntimeError(f"No valid files left in dataset after removing {bad_file}")
             # Try to fetch a different sample at the same index (now points to next file)
             return self.__getitem__(idx % len(self.files))
+        # Prefer temporal wav2vec2 frame features if present
+        if 'temporal_embedding' in data:
+            temporal = torch.from_numpy(data['temporal_embedding']).float()  # (768, T)
+            if 'labels' in data:
+                lbl = np.asarray(data['labels'])
+                lbl_bin = (lbl > 0).astype(np.float32)
+                labels = torch.from_numpy(lbl_bin).float()
+            else:
+                labels = torch.zeros(NUM_CLASSES, dtype=torch.float32)
+            # Time masking augmentation for temporal features
+            if self.augment:
+                T = temporal.shape[1]
+                if T > 4:
+                    max_mask = max(1, T // 5)  # mask up to 20% of time
+                    mask_width = np.random.randint(1, max_mask + 1)
+                    mask_start = np.random.randint(0, max(1, T - mask_width))
+                    temporal[:, mask_start:mask_start + mask_width] = 0.0
+            # Per-sample z-score normalization per channel
+            mean = temporal.mean(dim=-1, keepdim=True)
+            std = temporal.std(dim=-1, keepdim=True).clamp(min=1e-6)
+            temporal = (temporal - mean) / std
+            return temporal, labels
+
         # Prefer pretrained embeddings if present
         if 'embedding' in data:
             emb = torch.from_numpy(data['embedding']).float()
             # Return 1D embedding vector and labels
             if 'labels' in data:
-                labels = torch.from_numpy(data['labels']).float()
+                lbl = np.asarray(data['labels'])
+                lbl_bin = (lbl > 0).astype(np.float32)
+                labels = torch.from_numpy(lbl_bin).float()
             else:
                 labels = torch.zeros(NUM_CLASSES, dtype=torch.float32)
             return emb, labels
@@ -432,6 +462,13 @@ class AudioDataset(Dataset):
             spec_np = spectrogram.numpy()
             spec_np = self.augmentation(spec_np)
             spectrogram = torch.from_numpy(spec_np).float()
+
+        # Per-sample z-score normalization (zero mean, unit variance per channel)
+        # Critical: different feature channels (mel, MFCC, delta, spectral) have
+        # very different scales. Without normalization, the model struggles.
+        mean = spectrogram.mean(dim=-1, keepdim=True)
+        std = spectrogram.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        spectrogram = (spectrogram - mean) / std
 
         return spectrogram, labels
 
@@ -673,6 +710,8 @@ class Trainer:
         
         # Metrics
         self.metrics = MetricsTracker()
+        # Resume control: starting epoch index (0-based). Set by resume loader if restoring checkpoint.
+        self.start_epoch = 0
         
         # Class weights: compute dynamically from dataset if not provided
         if class_weights is not None:
@@ -820,9 +859,8 @@ class Trainer:
             else:
                 best_thresh = best_precision_only['thresh']
             
-            # SMOOTH thresholds with moving average to prevent oscillation
-            # Use exponential decay: 60% new, 40% previous
-            smoothed_thresh = (best_thresh * 0.6) + (self.previous_thresholds[class_idx] * 0.4)
+            # Light smoothing: 85% new, 15% previous (allows fast adaptation)
+            smoothed_thresh = (best_thresh * 0.85) + (self.previous_thresholds[class_idx] * 0.15)
             optimal_thresholds[class_idx] = smoothed_thresh
         
         # Save current thresholds for next epoch
@@ -1070,23 +1108,97 @@ class Trainer:
             self.patience_counter += 1
             self.save_checkpoint(epoch, is_best=False)
         
-        # Only step the ReduceLROnPlateau scheduler when using that scheduler
-        if getattr(self, 'scheduler_type', 'reduce') == 'reduce':
+        # Step the appropriate LR scheduler
+        sched_type = getattr(self, 'scheduler_type', 'reduce')
+        if sched_type == 'reduce':
             try:
                 self.scheduler.step(val_f1)
             except Exception:
                 pass
+        elif sched_type == 'cosine':
+            # CosineAnnealingLR must be stepped per-epoch (was previously missing!)
+            if getattr(self, '_external_scheduler', None) is not None:
+                try:
+                    self._external_scheduler.step()
+                except Exception:
+                    pass
         
         return avg_loss, val_f1
     
     def save_checkpoint(self, epoch, is_best=False):
         """Save model checkpoint to training-specific directory."""
+        # Build a full checkpoint dict to allow full resume (optimizer, scheduler, scaler, rng, epoch, best)
+        checkpoint = {
+            'epoch': int(epoch + 1),
+            'model_state': self.model.state_dict(),
+            'optimizer_state': getattr(self, 'optimizer', None).state_dict() if getattr(self, 'optimizer', None) is not None else None,
+            'scheduler_state': None,
+            'external_scheduler_state': None,
+            'scaler_state': None,
+            'best_f1': float(self.best_f1) if hasattr(self, 'best_f1') else None,
+            'metrics': getattr(self, 'metrics', None).metrics if getattr(self, 'metrics', None) is not None else None,
+        }
+
+        try:
+            if getattr(self, '_external_scheduler', None) is not None:
+                try:
+                    checkpoint['external_scheduler_state'] = self._external_scheduler.state_dict()
+                except Exception:
+                    checkpoint['external_scheduler_state'] = None
+            if getattr(self, 'scheduler', None) is not None:
+                try:
+                    checkpoint['scheduler_state'] = self.scheduler.state_dict()
+                except Exception:
+                    checkpoint['scheduler_state'] = None
+            if getattr(self, 'scaler', None) is not None:
+                try:
+                    checkpoint['scaler_state'] = self.scaler.state_dict()
+                except Exception:
+                    checkpoint['scaler_state'] = None
+        except Exception:
+            pass
+
+        # Save RNG states for reproducibility
+        try:
+            import random as _py_random
+            checkpoint['rng_python'] = _py_random.getstate()
+            checkpoint['rng_numpy'] = np.random.get_state()
+            try:
+                checkpoint['rng_torch'] = torch.get_rng_state()
+            except Exception:
+                checkpoint['rng_torch'] = None
+        except Exception:
+            pass
+
+        # Save EMA shadow parameters if EMA enabled
+        try:
+            if getattr(self, 'use_ema', False) and getattr(self, 'ema', None) is not None:
+                # convert tensors to CPU for portability
+                ema_shadow = {}
+                for p, v in self.ema.shadow.items():
+                    try:
+                        ema_shadow_key = None
+                        # find parameter name by matching object id
+                        for name, param in self.model.named_parameters():
+                            if param is p:
+                                ema_shadow_key = name
+                                break
+                        if ema_shadow_key is None:
+                            # fallback to str(id)
+                            ema_shadow_key = f'param_{id(p)}'
+                        ema_shadow[ema_shadow_key] = v.detach().cpu()
+                    except Exception:
+                        continue
+                checkpoint['ema_shadow'] = ema_shadow
+        except Exception:
+            pass
+
         checkpoint_path = self.checkpoint_dir / f'{self.model_name}_epoch_{epoch + 1:03d}.pth'
-        torch.save(self.model.state_dict(), checkpoint_path)
-        
+        torch.save(checkpoint, checkpoint_path)
+
         if is_best:
             best_path = self.checkpoint_dir / f'{self.model_name}_best.pth'
-            torch.save(self.model.state_dict(), best_path)
+            torch.save(checkpoint, best_path)
             print(f"  ✓✓ BEST MODEL FOUND! F1={self.best_f1:.4f} → {best_path}")
     
     def should_stop(self):
@@ -1103,23 +1215,54 @@ class Trainer:
         # Configure schedulers that require steps-per-epoch information (OneCycleLR, CosineAnnealing)
         self.total_epochs = int(num_epochs)
         self._step_per_batch = False
+        
+        # LR Warmup: linearly ramp up LR during first 3 epochs for stable early training
+        self._warmup_epochs = 3
+        self._warmup_start_lr = self.learning_rate * 0.01  # Start at 1% of target LR
+        self._warmup_target_lr = self.learning_rate
+        
         if getattr(self, 'scheduler_type', 'reduce') == 'onecycle':
             try:
                 steps_per_epoch = max(1, len(self.train_loader))
                 max_lr = self.max_lr if getattr(self, 'max_lr', None) is not None else self.learning_rate
                 self._external_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=max_lr, epochs=self.total_epochs, steps_per_epoch=steps_per_epoch)
                 self._step_per_batch = True
+                self._warmup_epochs = 0  # OneCycleLR has its own warmup
                 print(f"Configured OneCycleLR(max_lr={max_lr}, epochs={self.total_epochs}, steps_per_epoch={steps_per_epoch})")
             except Exception as e:
                 print('Failed to configure OneCycleLR:', e)
         elif getattr(self, 'scheduler_type', 'reduce') == 'cosine':
             try:
-                self._external_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.total_epochs)
-                print(f"Configured CosineAnnealingLR(T_max={self.total_epochs})")
+                # Use CosineAnnealing with warmup via SequentialLR
+                warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+                    self.optimizer, start_factor=0.01, end_factor=1.0, total_iters=self._warmup_epochs
+                )
+                cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optimizer, T_max=max(1, self.total_epochs - self._warmup_epochs), eta_min=1e-6
+                )
+                self._external_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    self.optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[self._warmup_epochs]
+                )
+                self._warmup_epochs = 0  # Handled by SequentialLR
+                print(f"Configured CosineAnnealingLR with {3}-epoch linear warmup (T_max={self.total_epochs - 3})")
             except Exception as e:
-                print('Failed to configure CosineAnnealingLR:', e)
+                print('Failed to configure CosineAnnealingLR with warmup:', e)
+                try:
+                    self._external_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.total_epochs)
+                    print(f"Fallback: CosineAnnealingLR(T_max={self.total_epochs})")
+                except Exception:
+                    pass
 
-        for epoch in range(num_epochs):
+        # Respect resume start epoch if provided (start_epoch is 0-based and stores last completed epoch when resuming)
+        start = int(getattr(self, 'start_epoch', 0))
+        for epoch in range(start, num_epochs):
+            # Manual warmup for schedulers that don't handle it internally (e.g., reduce)
+            if self._warmup_epochs > 0 and epoch < self._warmup_epochs:
+                warmup_lr = self._warmup_start_lr + (self._warmup_target_lr - self._warmup_start_lr) * (epoch / self._warmup_epochs)
+                for pg in self.optimizer.param_groups:
+                    pg['lr'] = warmup_lr
+                print(f"  [Warmup] Epoch {epoch+1}/{self._warmup_epochs}: LR={warmup_lr:.2e}")
+            
             train_loss = self.train_epoch(epoch)
             val_loss, val_f1 = self.validate(epoch)
             
@@ -1141,6 +1284,27 @@ class Trainer:
                 print()
             
             print('-' * 60)
+
+            # If SWA is configured, update the averaged weights after validation
+            try:
+                if getattr(self, 'swa_model', None) is not None:
+                    swa_start = int(getattr(self, 'swa_start', 99999))
+                    # trainer.start_epoch is 0-based; args.swa_start is 1-based. Use (epoch+1)
+                    if (epoch + 1) >= swa_start:
+                        try:
+                            # AveragedModel.update_parameters expects the source model
+                            self.swa_model.update_parameters(self.model)
+                            # Step SWA LR scheduler if configured
+                            if getattr(self, 'swa_scheduler', None) is not None:
+                                try:
+                                    self.swa_scheduler.step()
+                                except Exception:
+                                    pass
+                            print(f'Updated SWA averaged model at epoch {epoch + 1}')
+                        except Exception as e:
+                            print('SWA update failed:', e)
+            except Exception:
+                pass
             
             # If a freeze schedule was requested, unfreeze after configured epochs
             try:
@@ -1257,7 +1421,7 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.2, help='Dropout rate to pass to model constructors (default 0.2)')
     parser.add_argument('--grad-clip', type=float, default=1.0, help='Max norm for gradient clipping')
     parser.add_argument('--oversample', type=str, default='none', choices=['none', 'rare', 'weight'], help='Oversampling strategy (none, rare, weight)')
-    parser.add_argument('--arch', type=str, default='improved_90plus', choices=['improved_90plus', 'improved_90plus_large', 'improved_90plus_se', 'cnn_bilstm'], help='Model architecture to train')
+    parser.add_argument('--arch', type=str, default='improved_90plus', choices=['improved_90plus', 'improved_90plus_large', 'improved_90plus_se', 'cnn_bilstm', 'embedding_mlp', 'temporal_w2v', 'temporal_bilstm'], help='Model architecture to train')
     parser.add_argument('--auto-calibrate', action='store_true', help='Run threshold calibration automatically after training')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     parser.add_argument('--sched-patience', type=int, default=None, help='Scheduler patience for ReduceLROnPlateau (overrides constants.SCHEDULER_PATIENCE)')
@@ -1271,6 +1435,9 @@ def main():
     parser.add_argument('--loss-type', type=str, default=None, choices=['focal', 'bce', 'label_smoothing'], help='Loss type to use (overrides --use-bce/--use-label-smoothing)')
     parser.add_argument('--scheduler', type=str, default='reduce', choices=['reduce', 'onecycle', 'cosine'], help='LR scheduler to use')
     parser.add_argument('--max-lr', type=float, default=None, help='Max LR for OneCycleLR')
+    parser.add_argument('--use-swa', action='store_true', help='Enable SWA (stochastic weight averaging)')
+    parser.add_argument('--swa-start', type=int, default=80, help='Epoch to start SWA (1-based)')
+    parser.add_argument('--swa-lr', type=float, default=1e-5, help='SWA learning rate')
     # Augmentation overrides
     parser.add_argument('--aug-time-p', type=float, default=None, help='SpecAugment time-mask probability')
     parser.add_argument('--aug-freq-p', type=float, default=None, help='SpecAugment freq-mask probability')
@@ -1430,14 +1597,15 @@ def main():
 
         try:
             from torch.utils.data import WeightedRandomSampler
-            # Use weighted sampling; allow replacement when requested via CLI to enable true oversampling
+            # Use replacement=True by default for TRUE oversampling (rare samples seen multiple times)
+            # Without replacement, it just reorders - no actual oversampling effect.
             try:
-                replacement_flag = bool(args.sampler_replacement)
+                replacement_flag = not bool(getattr(args, 'sampler_no_replacement', False))
             except Exception:
-                replacement_flag = False
+                replacement_flag = True
             sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=replacement_flag)
             if replacement_flag:
-                print('Using WeightedRandomSampler (with replacement) for oversampling')
+                print('Using WeightedRandomSampler (with replacement) for true oversampling')
             else:
                 print('Using WeightedRandomSampler (no replacement) with inverse-frequency weighting')
         except Exception as e:
@@ -1478,6 +1646,72 @@ def main():
             print('Using ImprovedStutteringCNNLargeSE (with SE blocks)')
         except Exception as e:
             print('Failed to import improved SE model, falling back to standard ImprovedStutteringCNN:', e)
+            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
+            model_name = 'improved_90plus'
+    elif args.arch == 'embedding_mlp':
+        try:
+            from model_embedding_mlp import EmbeddingMLPClassifier
+            # Detect embedding dimension from first NPZ in data dir
+            _detect_dir = Path(args.data_dir) / 'train'
+            _emb_dim = 1536  # default for wav2vec2-base mean+std
+            for _f in _detect_dir.glob('*.npz'):
+                try:
+                    _d = np.load(_f)
+                    if 'embedding' in _d:
+                        _emb_dim = _d['embedding'].shape[0]
+                        break
+                except Exception:
+                    continue
+            model = EmbeddingMLPClassifier(input_dim=_emb_dim, n_classes=5, dropout=args.dropout)
+            model_name = 'embedding_mlp'
+            print(f'Using EmbeddingMLPClassifier (input_dim={_emb_dim}, dropout={args.dropout})')
+        except Exception as e:
+            print('Failed to import EmbeddingMLPClassifier:', e)
+            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
+            model_name = 'improved_90plus'
+    elif args.arch == 'temporal_w2v':
+        try:
+            from model_temporal_w2v import TemporalStutterClassifier
+            _detect_dir = Path(args.data_dir) / 'train'
+            _input_dim = 768
+            for _f in _detect_dir.glob('*.npz'):
+                try:
+                    _d = np.load(_f)
+                    if 'temporal_embedding' in _d:
+                        _input_dim = _d['temporal_embedding'].shape[0]
+                        break
+                except Exception:
+                    continue
+            model = TemporalStutterClassifier(input_dim=_input_dim, n_classes=5, hidden_dim=256, dropout=args.dropout)
+            model_name = 'temporal_w2v'
+            n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f'Using TemporalStutterClassifier (input_dim={_input_dim}, hidden=256, dropout={args.dropout}, params={n_p:,})')
+        except Exception as e:
+            print('Failed to import TemporalStutterClassifier:', e)
+            model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
+            model_name = 'improved_90plus'
+    elif args.arch == 'temporal_bilstm':
+        try:
+            from model_temporal_bilstm import TemporalBiLSTMClassifier
+            _detect_dir = Path(args.data_dir) / 'train'
+            _input_dim = 768
+            for _f in _detect_dir.glob('*.npz'):
+                try:
+                    _d = np.load(_f)
+                    if 'temporal_embedding' in _d:
+                        _input_dim = _d['temporal_embedding'].shape[0]
+                        break
+                except Exception:
+                    continue
+            model = TemporalBiLSTMClassifier(
+                input_dim=_input_dim, n_classes=5, hidden_dim=256,
+                lstm_hidden=128, lstm_layers=2, dropout=args.dropout
+            )
+            model_name = 'temporal_bilstm'
+            n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f'Using TemporalBiLSTMClassifier (input={_input_dim}, hidden=256, lstm=128x2, dropout={args.dropout}, params={n_p:,})')
+        except Exception as e:
+            print('Failed to import TemporalBiLSTMClassifier:', e)
             model = ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=args.dropout)
             model_name = 'improved_90plus'
     else:
@@ -1578,6 +1812,26 @@ def main():
         neutral_pos_weight=args.neutral_pos_weight,
         freeze_epochs=(args.freeze_epochs if hasattr(args, 'freeze_epochs') else None),
     )
+    # Setup SWA if requested and available
+    if args.use_swa and AveragedModel is not None:
+        try:
+            trainer.swa_model = AveragedModel(trainer.model)
+            trainer.swa_start = max(1, int(args.swa_start))
+            if SWALR is not None:
+                try:
+                    trainer.swa_scheduler = SWALR(trainer.optimizer, swa_lr=float(args.swa_lr))
+                except Exception:
+                    trainer.swa_scheduler = None
+            else:
+                trainer.swa_scheduler = None
+            print(f'Configured SWA: start={trainer.swa_start}, swa_lr={args.swa_lr}')
+        except Exception as e:
+            print('Failed to configure SWA:', e)
+            trainer.swa_model = None
+            trainer.swa_scheduler = None
+    else:
+        trainer.swa_model = None
+        trainer.swa_scheduler = None
     # If user requested to resume/load model weights for fine-tuning, attempt to load before training
     if args.resume is not None:
         try:
@@ -1588,10 +1842,11 @@ def main():
                 # Extract state_dict if wrapped in checkpoint dict
                 sd = None
                 if isinstance(state, dict):
-                    if 'state_dict' in state:
-                        sd = state['state_dict']
-                    elif 'model_state' in state:
+                    # Full checkpoint dict (saved by Trainer.save_checkpoint) contains 'model_state' and other keys
+                    if 'model_state' in state:
                         sd = state['model_state']
+                    elif 'state_dict' in state:
+                        sd = state['state_dict']
                     elif 'model' in state and isinstance(state['model'], dict):
                         sd = state['model']
                     else:
@@ -1610,6 +1865,94 @@ def main():
                         print('Failed to load checkpoint weights:', e)
                 else:
                     print('Checkpoint weights loaded successfully')
+                # Restore optimizer, scheduler, scaler and training epoch if available
+                try:
+                    if isinstance(state, dict):
+                        if 'optimizer_state' in state and state['optimizer_state'] is not None and getattr(trainer, 'optimizer', None) is not None:
+                            try:
+                                trainer.optimizer.load_state_dict(state['optimizer_state'])
+                                print('Loaded optimizer state from checkpoint')
+                            except Exception as e:
+                                print('Failed to load optimizer state:', e)
+                        # Scheduler
+                        if 'scheduler_state' in state and state['scheduler_state'] is not None and getattr(trainer, 'scheduler', None) is not None:
+                            try:
+                                trainer.scheduler.load_state_dict(state['scheduler_state'])
+                                print('Loaded scheduler state from checkpoint')
+                            except Exception as e:
+                                print('Failed to load scheduler state:', e)
+                        # External scheduler (OneCycle etc.)
+                        if 'external_scheduler_state' in state and state['external_scheduler_state'] is not None and getattr(trainer, '_external_scheduler', None) is not None:
+                            try:
+                                trainer._external_scheduler.load_state_dict(state['external_scheduler_state'])
+                                print('Loaded external scheduler state from checkpoint')
+                            except Exception:
+                                pass
+                        # AMP scaler
+                        if 'scaler_state' in state and state['scaler_state'] is not None and getattr(trainer, 'scaler', None) is not None:
+                            try:
+                                trainer.scaler.load_state_dict(state['scaler_state'])
+                                print('Loaded AMP scaler state from checkpoint')
+                            except Exception as e:
+                                print('Failed to load AMP scaler state:', e)
+                        # Best f1 and metrics
+                        if 'best_f1' in state and state['best_f1'] is not None:
+                            try:
+                                trainer.best_f1 = float(state['best_f1'])
+                                print(f"Restored best_f1={trainer.best_f1}")
+                            except Exception:
+                                pass
+                        if 'metrics' in state and state['metrics'] is not None:
+                            try:
+                                trainer.metrics.metrics = state['metrics']
+                                print('Restored metrics from checkpoint')
+                            except Exception:
+                                pass
+                        # RNGs (best-effort)
+                        try:
+                            import random as _py_random
+                            if 'rng_python' in state:
+                                try: _py_random.setstate(state['rng_python'])
+                                except Exception: pass
+                            if 'rng_numpy' in state:
+                                try: np.random.set_state(state['rng_numpy'])
+                                except Exception: pass
+                            if 'rng_torch' in state and state['rng_torch'] is not None:
+                                try: torch.set_rng_state(state['rng_torch'])
+                                except Exception: pass
+                        except Exception:
+                            pass
+                        # Restore EMA shadow if present
+                        try:
+                            if 'ema_shadow' in state and getattr(trainer, 'ema', None) is not None:
+                                ema_shadow = state.get('ema_shadow', None)
+                                if isinstance(ema_shadow, dict):
+                                    # Map from param names to tensors; assign into trainer.ema.shadow by matching names
+                                    name_to_param = {n: p for n, p in trainer.model.named_parameters()}
+                                    new_shadow = {}
+                                    for k, v in ema_shadow.items():
+                                        if k in name_to_param:
+                                            new_shadow[name_to_param[k]] = v.to(trainer.device)
+                                        else:
+                                            # best effort: assign by ordering
+                                            pass
+                                    # replace ema.shadow where possible
+                                    for p in trainer.ema.collected:
+                                        if p in new_shadow:
+                                            trainer.ema.shadow[p].copy_(new_shadow[p])
+                                    print('Restored EMA shadow parameters from checkpoint')
+                        except Exception as e:
+                            print('Failed to restore EMA shadow from checkpoint:', e)
+                        # Set resume start epoch (state['epoch'] stores last completed epoch as 1-based)
+                        if 'epoch' in state:
+                            try:
+                                last_epoch = int(state['epoch'])
+                                trainer.start_epoch = last_epoch
+                                print(f"Resuming training from next epoch (start_epoch set to {trainer.start_epoch})")
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print('Warning: failed to fully restore optimizer/scheduler/scaler from checkpoint:', e)
             else:
                 print(f'Resume checkpoint not found: {resume_path}')
         except Exception as e:
@@ -1634,6 +1977,33 @@ def main():
     if best_model_path.exists():
         # Copy to overall best location
         shutil.copy(str(best_model_path), str(best_link_path))
+
+    # If SWA was used, finalize and save SWA model
+    try:
+        if getattr(trainer, 'swa_model', None) is not None:
+            swa_model = trainer.swa_model
+            # Update batch norm statistics using training data
+            try:
+                if update_bn is not None:
+                    print('Updating batch-norm statistics for SWA model...')
+                    update_bn(trainer.train_loader, swa_model)
+            except Exception as e:
+                print('SWA update_bn failed:', e)
+
+            swa_path = trainer.checkpoint_dir / f'{model_name}_swa.pth'
+            # Save full checkpoint for SWA model
+            try:
+                swa_ckpt = {
+                    'epoch': args.epochs,
+                    'model_state': swa_model.module.state_dict() if hasattr(swa_model, 'module') else swa_model.state_dict(),
+                    'best_f1': trainer.best_f1
+                }
+                torch.save(swa_ckpt, swa_path)
+                print(f'Saved SWA model to {swa_path}')
+            except Exception as e:
+                print('Failed to save SWA model:', e)
+    except Exception:
+        pass
     
     print(f"\n✅ Training Complete!")
     print(f"├─ Checkpoint folder: {trainer.checkpoint_dir}")

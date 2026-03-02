@@ -14,7 +14,12 @@ from constants import TOTAL_CHANNELS, NUM_CLASSES
 
 def load_npz(path: Path):
     data = np.load(path)
-    if 'spectrogram' in data:
+    # Support temporal wav2vec2 features
+    if 'temporal_embedding' in data:
+        spec = data['temporal_embedding']  # (768, T)
+    elif 'embedding' in data:
+        spec = data['embedding']  # (1536,) — 1D embedding
+    elif 'spectrogram' in data:
         spec = data['spectrogram']
     else:
         return None, None
@@ -43,36 +48,99 @@ def main(args):
     # Load checkpoint and auto-detect model architecture by state_dict keys
     raw = torch.load(str(ckpt), map_location='cpu')
     # unwrap common wrappers
-    if isinstance(raw, dict) and 'state_dict' in raw:
-        state = raw['state_dict']
+    if isinstance(raw, dict) and ('state_dict' in raw or 'model_state_dict' in raw or 'model_state' in raw):
+        state = raw.get('state_dict', raw.get('model_state_dict', raw.get('model_state')))
     else:
         state = raw if isinstance(raw, dict) else {}
 
     # strip module prefixes
     state = {k.replace('module.', ''): v for k, v in state.items()} if isinstance(state, dict) else state
 
-    # heuristics to choose model
+    # heuristics to choose model — support ALL architectures
     keys = set(state.keys()) if isinstance(state, dict) else set()
-    use_improved = any(k.startswith('block1.') or k.startswith('attention.') or k.startswith('fc1.') for k in keys)
+    use_large = any(k.startswith('ms_conv1.') for k in keys)  # ms_conv1 is unique to ImprovedStutteringCNNLarge
+    use_improved = any(k.startswith('block1.') for k in keys)
     use_cnn_bilstm = any(k.startswith('lstm.') or k.startswith('classifier.') or k.startswith('conv1.') for k in keys)
+    use_embedding_mlp = any(k.startswith('input_bn.') or k.startswith('backbone.') for k in keys)
+    use_temporal_w2v = any(k.startswith('proj.') and any(k2.startswith('temporal_blocks.') for k2 in keys) for k in keys)
+    use_temporal_bilstm = any(k.startswith('lstm_norm.') and any(k2.startswith('temporal_blocks.') for k2 in keys) for k in keys)
 
-    if use_cnn_bilstm and not use_improved:
-        print('Detected checkpoint for CNNBiLSTM, loading CNNBiLSTM')
-        model = CNNBiLSTM(in_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)
-    else:
-        print('Defaulting to ImprovedStutteringCNN (detected keys indicate improved or ambiguous)')
-        model = ImprovedStutteringCNN(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)
-
-    try:
-        model.load_state_dict(state)
-    except Exception as e:
-        # last-resort: try mapping similar key names (e.g., conv/bn naming differences)
-        new = {k.replace('conv2d', 'conv2').replace('bn2d', 'bn2'): v for k, v in state.items()}
+    # Try loading in order of likelihood
+    candidates = []
+    if use_temporal_bilstm:
         try:
-            model.load_state_dict(new)
-        except Exception as e2:
-            print('Failed to load state_dict into chosen model:', e)
-            raise
+            from model_temporal_bilstm import TemporalBiLSTMClassifier
+            _input_dim = 768
+            for k, v in state.items():
+                if k == 'proj.0.weight':
+                    _input_dim = v.shape[1]
+                    break
+            candidates.append(('TemporalBiLSTMClassifier', TemporalBiLSTMClassifier(input_dim=_input_dim, n_classes=NUM_CLASSES, hidden_dim=256, lstm_hidden=128, lstm_layers=2, dropout=0.3)))
+        except Exception:
+            pass
+    if use_temporal_w2v and not use_temporal_bilstm:
+        try:
+            from model_temporal_w2v import TemporalStutterClassifier
+            _input_dim = 768
+            for k, v in state.items():
+                if k == 'proj.0.weight':
+                    _input_dim = v.shape[1]
+                    break
+            candidates.append(('TemporalStutterClassifier', TemporalStutterClassifier(input_dim=_input_dim, n_classes=NUM_CLASSES, hidden_dim=256, dropout=0.3)))
+        except Exception:
+            pass
+    if use_embedding_mlp:
+        try:
+            from model_embedding_mlp import EmbeddingMLPClassifier
+            _emb_dim = 1536
+            for k, v in state.items():
+                if k == 'backbone.0.fc.weight':
+                    _emb_dim = v.shape[1]
+                    break
+                elif k == 'input_bn.weight':
+                    _emb_dim = v.shape[0]
+                    break
+            candidates.append(('EmbeddingMLPClassifier', EmbeddingMLPClassifier(input_dim=_emb_dim, n_classes=NUM_CLASSES, dropout=0.3)))
+        except Exception:
+            pass
+    if use_large:
+        try:
+            from model_improved_90plus_large import ImprovedStutteringCNNLarge
+            candidates.append(('ImprovedStutteringCNNLarge', ImprovedStutteringCNNLarge(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES, dropout=0.35)))
+        except Exception:
+            pass
+    if use_improved:
+        candidates.append(('ImprovedStutteringCNN', ImprovedStutteringCNN(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)))
+    if use_cnn_bilstm:
+        candidates.append(('CNNBiLSTM', CNNBiLSTM(in_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)))
+    # Always add all as fallbacks
+    try:
+        from model_improved_90plus_large import ImprovedStutteringCNNLarge
+        candidates.append(('ImprovedStutteringCNNLarge', ImprovedStutteringCNNLarge(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES, dropout=0.35)))
+    except Exception:
+        pass
+    candidates.append(('ImprovedStutteringCNN', ImprovedStutteringCNN(n_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)))
+    candidates.append(('CNNBiLSTM', CNNBiLSTM(in_channels=TOTAL_CHANNELS, n_classes=NUM_CLASSES)))
+
+    model = None
+    for cls_name, m in candidates:
+        try:
+            m.load_state_dict(state)
+            model = m
+            print(f'Loaded checkpoint as {cls_name}')
+            break
+        except Exception:
+            try:
+                stripped = {k.replace('module.', ''): v for k, v in state.items()}
+                m.load_state_dict(stripped)
+                model = m
+                print(f'Loaded checkpoint as {cls_name} (stripped keys)')
+                break
+            except Exception:
+                continue
+
+    if model is None:
+        raise RuntimeError('Could not load state_dict into any known model class')
 
     model.to(device)
     model.eval()
@@ -85,10 +153,10 @@ def main(args):
     all_probs = []
     all_labels = []
     max_len = 0
-    # first pass compute max length to pad
+    # first pass compute max length to pad (only for 2D features)
     for p in files:
         spec, labels = load_npz(p)
-        if spec is None:
+        if spec is None or spec.ndim < 2:
             continue
         max_len = max(max_len, spec.shape[1])
 
@@ -97,7 +165,25 @@ def main(args):
             spec, labels = load_npz(p)
             if spec is None:
                 continue
-            # ensure channel count
+            # Handle 1D embeddings (MLP model)
+            if spec.ndim == 1:
+                x = torch.from_numpy(spec).unsqueeze(0).to(device)
+                logits = model(x)
+                probs = torch.sigmoid(logits).cpu().numpy()[0]
+                all_probs.append(probs)
+                all_labels.append(labels)
+                continue
+            # Handle temporal embeddings (768, T) — skip channel validation
+            if spec.shape[0] != TOTAL_CHANNELS and spec.shape[0] > TOTAL_CHANNELS:
+                # Temporal or large-channel features — use as-is, just pad time
+                spec = pad_to_length(spec, max_len)
+                x = torch.from_numpy(spec).unsqueeze(0).to(device)
+                logits = model(x)
+                probs = torch.sigmoid(logits).cpu().numpy()[0]
+                all_probs.append(probs)
+                all_labels.append(labels)
+                continue
+            # Standard spectrogram path: ensure channel count
             if spec.shape[0] != TOTAL_CHANNELS:
                 if spec.shape[0] < TOTAL_CHANNELS:
                     spec = np.pad(spec, ((0, TOTAL_CHANNELS - spec.shape[0]), (0, 0)), mode='constant')

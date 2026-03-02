@@ -12,10 +12,10 @@ AUG_STRETCH_P = 0.25
 AUG_PITCH_P = 0.25
 AUG_SNR_P = 0.25
 # Threshold optimization
-# Increase lower bound and step to avoid degenerate all-positive threshold picks
-THRESH_SEARCH_START = 0.5
-THRESH_SEARCH_END = 0.95
-THRESH_SEARCH_STEP = 0.05
+# Wider range to find optimal per-class thresholds (was 0.5-0.95, too narrow)
+THRESH_SEARCH_START = 0.25
+THRESH_SEARCH_END = 0.85
+THRESH_SEARCH_STEP = 0.025
 # Scheduler and training
-SCHEDULER_PATIENCE = 5
+SCHEDULER_PATIENCE = 7
 THRESHOLD_OPT_EPOCHS = 5
