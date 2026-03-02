@@ -1,1085 +1,1283 @@
-# AGNI — Stutter Detection & Repair
+# AGNI - Stuttering Detection & Repair System
 
-Short project README providing an overview, architecture diagram, end-to-end instructions, implementation pointers, and evaluation results.
-
-## Project Overview
-
-- Purpose: AGNI is an end-to-end system for detecting stuttering phenomena in conversational audio and repairing detected stutter regions using spectral inpainting and vocoder-based approaches. It combines feature extraction, a CNN-based multi-label detector, and an advanced repair module.
-- Repo layout (key files):
-  - `Models/model_improved_90plus.py` — CNN model architecture (`ImprovedStutteringCNN`).
-  - `Models/train_90plus_final.py` — training loop, dataset, and trainer utilities.
-  - `Models/enhanced_audio_preprocessor.py` — robust 123-channel feature extraction (mel, MFCCs, deltas, spectral features).
-  - `Models/extract_features_90plus.py` — batch NPZ feature extractor for dataset creation.
-  - `Models/repair_advanced.py` — detection+repair implementation (vocoder & SciPy fallbacks).
-  - `Models/COMPLETE_PIPELINE.py` — end-to-end orchestration (feature extraction, training, evaluation, detect+repair).
-
-  ## Recent updates (Feb 19, 2026)
-
-  - **Goal:** Harden the AGNI pipeline for clinical-trial readiness — robust extraction, stable training, per-class calibration, and reproducible evaluation.
-  - **Preprocessing / Extraction:** `Models/enhanced_audio_preprocessor.py` and `Models/extract_features_90plus.py` were hardened (VAD trimming with amplitude fallback, NaN/Inf sanitization, corrupted-audio staging). Full extraction completed: **31,915** NPZ feature files written (train/val split: ~25,445 / 6,470).
-  - **PyTorch / Env fixes:** Resolved Windows DLL load issues (fbgemm.dll) by switching to a CPU-compatible PyTorch wheel and ensuring required runtimes — `torch` now imported successfully in the `agni` env.
-  - **Training script improvements:** `Models/train_90plus_final.py` patched to add:
-    - Gradient accumulation (`--accumulate`), conditional AMP/GradScaler only on CUDA, EMA support (`--use-ema`), `--omp-threads` and `--num-workers` tuning.
-    - Robust collate/augmentation fixes (mask bounds, padding), guarded logger flush on exit.
-    - Oversampling safety: `WeightedRandomSampler` now sampled without replacement and BCE `pos_weight` is neutralized when `--oversample rare` is used to avoid double-upweighting positives.
-    - CLI flags: `--sched-patience`, `--early-stop`, `--auto-calibrate`, `--verbose`.
-  - **Calibration and evaluation:** `Models/calibrate_thresholds.py` and `Models/eval_validation.py` were patched to auto-detect checkpoint architectures (CNNBiLSTM vs ImprovedStutteringCNN) and produce per-class calibrated thresholds. Calibration wrote `output/thresholds.json` (example thresholds: [0.49, 0.48, 0.5, 0.51, 0.49]).
-  - **Diagnostics added:** `Models/diagnose_best_checkpoint.py` added — computes per-class TP/FP/TN/FN and top false positives/negatives using calibrated thresholds and writes `output/diag_<ckpt>/diagnostics.json`.
-  - **Recent training run (final long run):** command used:
-    ```powershell
-    python Models/train_90plus_final.py --epochs 100 --batch-size 96 --arch cnn_bilstm --oversample rare --auto-calibrate --verbose --num-workers 2 --omp-threads 4 --accumulate 4 --use-ema --sched-patience 5 --early-stop 15
-    ```
-    - Result: early stopped at epoch 16; best checkpoint: `Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth`.
-  - **Evaluation (best CNN-BiLSTM checkpoint):** run `python Models/eval_validation.py --checkpoint Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth --data-dir datasets/features` produced:
-    - Per-class AUCs: [0.6174, 0.6124, 0.6261, 0.6144, 0.6428]
-    - Per-class APs:  [0.3979, 0.5078, 0.3056, 0.2418, 0.4819]
-    - Plots + metrics saved: `output/eval_cnn_bilstm_best/`
-  - **Calibration output:** `output/thresholds.json` (thresholds + per-class F1 summary + temperature for softmax scaling).
-
-  ## Quick diagnostic artifacts (paths)
-
-  - Best checkpoint: `Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth`
-  - Eval metrics + plots: `output/eval_cnn_bilstm_best/`
-  - Calibrated thresholds: `output/thresholds.json`
-  - Diagnostics (TP/FP lists): `output/diag_cnn_bilstm_best/diagnostics.json` (created by `Models/diagnose_best_checkpoint.py`).
-
-  ## Recommended next experiments (priority for PPT/action)
-
-  - A/B training: compare `--oversample none` vs `--oversample rare` (we neutralized pos_weight for rare, but an A/B will confirm precision/recall tradeoffs).
-  - Try `ImprovedStutteringCNN` (higher capacity + attention) on the same data with the improved training defaults.
-  - Conservative loss reweighting: cap per-class `pos_weight` (e.g., ≤3) or use `FocalLoss(gamma=1.0)` to reduce false positives.
-  - Run targeted augmentation and per-class focal tuning for classes with low AP (Sound/Word repetition).
-
-  If you want, I can generate PPT-ready slides (bullet text + suggested visuals) from this section.
-
-## Architecture Diagram (Mermaid)
-
-```mermaid
-*** README: AGNI — Stutter Detection & Repair (project files review) ***
-
-This README now documents only what is implemented in the repository files you asked me to read. It removes references to components not present and summarizes training artifacts produced so far.
-
-Files used to produce this README:
-- `Models/COMPLETE_PIPELINE.py`
-- `Models/constants.py`
-- `Models/diagnostic_checks.py`
-- `Models/enhanced_audio_preprocessor.py`
-- `Models/extract_features_90plus.py`
-- `Models/extract_features.py`
-- `Models/eval_validation.py`
-- `Models/inspect_val_stats.py`
-- `Models/inspect_probs.py`
-- `Models/repair_advanced.py`
-- `Models/model_improved_90plus.py`
-- `Models/utils.py`
-- `Models/train_90plus_final.py`
-
-Summary
--------
-- Purpose: detect stuttering events (5 multi-label classes) from audio features and optionally produce repaired audio using spectral-inpainting/vocoder fallbacks.
-- Feature extractor: `EnhancedAudioPreprocessor` → 123-channel feature stack (mel + MFCC + deltas + spectral features).
-- Model: `ImprovedStutteringCNN` (residual 1D CNN with attention). Input shape: `(batch, 123, time_steps)` → output logits `(batch, 5)`.
-- Training script: `train_90plus_final.py` (data loaders, augmentations, focal/label-smoothing, EMA, threshold optimization, checkpointing).
-- Evaluation: `eval_validation.py` (computes per-class AUC/AP and saves plots + `metrics.json`).
-- Repair: `repair_advanced.py` (uses `EnhancedAudioPreprocessor`; prefers `librosa` but includes SciPy fallbacks already patched).
-
-What has been trained (current artifacts)
----------------------------------------
-- Training run completed and checkpointed. Relevant artifacts:
-  - Checkpoints directory: `Models/checkpoints/`
-  - Best checkpoint (from recent run): `Models/checkpoints/training_20260217_013705/improved_90plus_best.pth`
-  - Alternative best build present: `Models/checkpoints/improved_90plus_BEST_OVERALL.pth`
-
-- Training run details (from logs):
-  - Completed: 60 epochs
-  - Best validation F1: 0.5391
-  - Best validation Precision: 0.4217
-  - Best validation Recall: 0.7706
-  - Validation ROC AUC (aggregate): ~0.7493
-
-Validation metrics (from `output/eval_improved_90plus_best/metrics.json`):
-
-Per-class AUC and AP (binary labels where label>0 is positive):
-
-```
-AUC = [0.7663057596, 0.6678425992, 0.7695011562, 0.7176713754, 0.82514403097]
-AP  = [0.6241651300, 0.5634030785, 0.5409565690, 0.3741414754, 0.7837044118]
-```
-
-Example outputs produced during testing
---------------------------------------
-- Detection JSON: `output/analysis/WomenWhoStutter_50_0_detection.json`
-- Repaired audio (using SciPy fallback path): `output/repaired_audio/WomenWhoStutter_50_0_repaired.wav`
-
-How to run core commands
-------------------------
-- Evaluate a trained checkpoint (generates plots + `metrics.json`):
-
-```powershell
-python Models/eval_validation.py --checkpoint Models/checkpoints/training_20260217_013705/improved_90plus_best.pth --data-dir datasets/features --gpu
-```
-
-- Run detection+repair on a single file (pipeline auto-detects model if available):
-
-```powershell
-python Models/COMPLETE_PIPELINE.py --repair-only --test-file "path\to\audio.wav" --log-level INFO
-```
-
-Implementation notes (concise)
-----------------------------
-- `Models/model_improved_90plus.py`: Residual 1D conv blocks, attention, global avg+max pooling, two FC layers → logits. Parameter count ~4.7M for 123-channel input.
-- `Models/enhanced_audio_preprocessor.py`: Extracts mel, MFCC, deltas, spectral centroid/rolloff/zcr/flux and stacks into 123 channels. Uses `librosa` if available; SciPy fallbacks implemented.
-- `Models/train_90plus_final.py`: Training logic with FocalLoss/LabelSmoothingBCELoss wrappers, dynamic pos_weight computed from training NPZs, augmentation, EMA support, threshold optimization and checkpoint saving under `Models/checkpoints/`.
-- `Models/repair_advanced.py`: Repair pipeline that first detects regions (model-based or fallback) then applies spectral inpainting and smoothing; uses SciPy fallbacks when `librosa`/`numba` are not compatible.
-
-Diagnostic helpers
-------------------
-- `Models/diagnostic_checks.py`: label mapping, small feature smoke tests, and a model forward-pass test.
-- `Models/inspect_val_stats.py`: counts positive labels in validation NPZs.
-- `Models/inspect_probs.py`: runs model on val NPZs and prints per-class probability stats and computed AUC/AP.
-
-Notes
------
-- README now only references files that exist in the repository and summarizes the actual trained artifacts and evaluation outputs produced.
-- I removed references to components not present in the repository. If you want the README to include additional details (full model source, training hyperparameters snapshot, or plots embedded), tell me which and I will add them.
-
-Next actions (pick one)
-----------------------
-1) Add the full `ImprovedStutteringCNN` code inline in README for quick offline reading.
-2) Create `run_demo.ps1` to run detection+repair on a chosen file and print output locations.
-3) Create a reproducible virtualenv here and attempt to install compatible `librosa`/`numba` to enable the original vocoder path and re-run repair.
-
-Tell me which next action to take and I'll proceed.
-Model: EnhancedStutteringCNN
-  - 7 layers (with residual + attention)
-  - 3.998M parameters
-  - Input: (1, 80 mels, 256 frames ~ 2.56s)
-  
-Optimizer: AdamW
-  - Learning rate: 1e-4 (crucial fix!)
-  - Weight decay: 1e-5
-  - Beta: (0.9, 0.999)
-
-Loss: Weighted Binary Cross-Entropy
-  - Class weights: [0.636, 0.424, 1.095, 1.858, 0.987]
-  - Per-class reweighting for imbalance
-
-Training:
-  - Batch size: 96 (1-1.5 hours)
-  - Epochs: 30 (with early stopping, patience=7)
-  - Threshold: 0.3 (for multi-label)
-  - LR Scheduler: ReduceLROnPlateau (0.5 factor, patience=3)
-```
-
-### Epoch 1 Results (After Fixes)
-```
-TRAIN F1 (macro): 0.2697  ✅
-VAL F1 (macro):   0.2527  ✅
-
-Per-class F1:
-  - Prolongation:       0.3210
-  - Block:              0.4609  ⭐ Best
-  - Sound Repetition:   0.2163
-  - Word Repetition:    0.0287  (rare class)
-  - Interjection:       0.2365
-
-Training Loss: 0.5627
-Validation Loss: 0.4754
-ROC AUC: 0.5162
-Recall: 0.8015 (catching 80% of stutters!)
-```
-
-### Expected Training Trajectory (UPDATED v2)
-```
-Epochs 1-3:   Warming up 
-              Val F1: 0.25-0.30
-              Keep training!
-
-Epochs 5-10:  Steady improvement
-              Val F1: 0.35-0.45
-              Getting better ⬆️
-
-Epochs 15-25: PEAK PERFORMANCE ⭐
-              Val F1: 0.50-0.70
-              Best model likely here
-
-Epoch 30:     Final checkpoint
-              Val F1: 0.45-0.70
-              Best saved automatically
-
-Timeline: ~17 hours with batch-96 (35 min/epoch)
-          ~20 hours with batch-64 (40 min/epoch)
-```
-
-**New Fixes:** LR=5e-5 (not 1e-4), Dropout=0.5/0.4 (not 0.4/0.3), No early stopping
+> End-to-end multi-label stuttering detection using wav2vec2 temporal features, BiLSTM+CNN classifiers, self-training label refinement, ensemble learning, and test-time augmentation. Includes vocoder-based stutter repair.
 
 ---
 
-**0. preprocess_data.py** (DATA PREPROCESSING - Run Once Before Training!)
-- Purpose: Extract Log-Mel spectrograms from raw audio files
-- When: **ONE-TIME ONLY** before your first training (then skip)
-- Features: Automatic train/val split (80/20), batch processing, progress bar
-- Command: `python Models/preprocess_data.py`
-- Output: 
-  - `datasets/features/train/` (~24k spectrogram files)
-  - `datasets/features/val/` (~6k spectrogram files)
-- Time: **~2 minutes** on i7-1165G7
-- Size: 2.5 GB total features on disk
-- Check if needed: If `datasets/features/train/` has files, skip preprocessing!
-- Details: Creates 80×256 Mel-spectrograms (2.56s windows) from 16kHz audio
-- Reuse: After preprocessing once, use extracted features for all training runs
+## Table of Contents
 
-**1. improved_train_enhanced.py** (TRAINING - Run First)
-- Purpose: Train the stuttering detection model
-- When: Only once at the beginning
-- Features: Class weighting, mixed precision, early stopping, tqdm progress bars
-- Command (Recommended): `python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 64`
-- Alt Command (Faster): `python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 96`
-- Alt Command (Slower): `python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 32`
-- Output: `Models/checkpoints/enhanced_best.pth` (~3.4 MB)
-- Time: **1-2 hours (batch-64, i7-1165G7)** | 2-3 hours (batch-32) | 1-1.5 hours (batch-96)
-- Device: CPU (Intel Iris Xe GPU not recommended for this task)
-- Progress: Real-time tqdm per-epoch with loss tracking
-
-**2. predict_enhanced.py** (TESTING - After Training)
-- Purpose: Test detection on audio files
-- When: After training to verify model works
-- Supports: Single file or batch processing
-- Command (Default threshold 0.3): `python Models/predict_enhanced.py --model enhanced --input audio.wav --output result.json`
-- Command (Custom threshold): `python Models/predict_enhanced.py --model enhanced --input audio.wav --output result.json --threshold 0.3`
-- Output: `result.json` (stuttering %, per-class probabilities, confidence scores)
-- Time: <10 seconds per file
-- Tested: ✅ Works correctly with FluencyBank_010_0.wav
-
-**3. run_asr_map_repair.py** (FULL PIPELINE - To Get Repaired Audio)
-- Purpose: Complete end-to-end workflow (detect → transcribe → map → repair)
-- When: When you want final repaired audio
-- Modes: 
-  - `attenuate` (default, recommended) - reduce stuttered word volume by 10dB
-  - `silence` - replace stuttered segments with silence
-  - `remove` - excise stuttered words (aggressive)
-- Command (Attenuate mode): `python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file audio.wav --output_file output.wav --mode attenuate --threshold 0.3`
-- Command (Silence mode): `python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file audio.wav --output_file output.wav --mode silence --threshold 0.3`
-- Command (Remove mode): `python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file audio.wav --output_file output.wav --mode remove --threshold 0.3`
-- Output: 
-  - Repaired WAV file
-  - JSON report with detected windows, word mapping, repair details
-- Time: 30-60 seconds per file (includes Whisper ASR)
-- Tested: ✅ Works correctly, creates repaired audio + repair report
-
-### 🔧 MAIN SCRIPTS & SUPPORT SCRIPTS
-
-#### ⭐ MAIN / PRIMARY SCRIPTS (Required & Use These)
-
-| Script | Used For | Purpose | Size |
-|--------|----------|---------|------|
-| **preprocess_data.py** | **Data Prep** | **Extract spectrograms from audio (RUN FIRST!)** | **4.2 KB** |
-| improved_train_enhanced.py | Training | Train the stuttering detection model | 12.4 KB |
-| predict_enhanced.py | Testing | Detect stuttering on audio files | 8.9 KB |
-| run_asr_map_repair.py | Repair | Full pipeline: detect → transcribe → repair audio | 14.7 KB |
-
-#### 🔧 SUPPORT SCRIPTS (Required by the main scripts)
-
-Required for the main scripts to work:
-
-| Script | Used By | Purpose | Size |
-|--------|---------|---------|------|
-| model_enhanced.py | Training | Enhanced model (7 layers, attention, residual) | 7.3 KB |
-| model_cnn.py | Training/Testing | SimpleCNN baseline (4 layers) | 2.3 KB |
-| features.py | All | Log-Mel spectrogram extraction | 3.1 KB |
-| asr_whisper.py | Repair | Speech-to-text transcription | 8.3 KB |
-| repair.py | Repair | Audio editing engine | 9.5 KB |
-| map_sed_words.py | Repair | Window-to-word alignment | 1.9 KB |
-| utils.py | All | Helper functions | 4.9 KB |
-| __init__.py | All | Package init | 0.4 KB |
+1. [Project Overview](#1-project-overview)
+2. [System Requirements](#2-system-requirements)
+3. [Installation & Environment Setup](#3-installation--environment-setup)
+4. [Dataset](#4-dataset)
+5. [Feature Extraction](#5-feature-extraction)
+   - 5.1 [123-Channel Spectrogram Features](#51-123-channel-spectrogram-features)
+   - 5.2 [Temporal wav2vec2 Features (Primary)](#52-temporal-wav2vec2-features-primary)
+6. [Model Architectures](#6-model-architectures)
+   - 6.1 [TemporalBiLSTMClassifier (Primary - 2.07M params)](#61-temporalbilstmclassifier-primary---207m-params)
+   - 6.2 [TemporalStutterClassifier (870K params)](#62-temporalstutterclassifier-870k-params)
+   - 6.3 [CNNBiLSTM (Baseline)](#63-cnnbilstm-baseline)
+   - 6.4 [ImprovedStutteringCNN](#64-improvedstutteringcnn)
+   - 6.5 [ImprovedStutteringCNNLarge](#65-improvedstutteringcnnlarge)
+   - 6.6 [ImprovedStutteringCNNLargeSE](#66-improvedstutteringcnnlargese)
+7. [Training System](#7-training-system)
+   - 7.1 [Data Loading & Augmentation](#71-data-loading--augmentation)
+   - 7.2 [Loss Functions](#72-loss-functions)
+   - 7.3 [Optimizers & Schedulers](#73-optimizers--schedulers)
+   - 7.4 [Training Techniques](#74-training-techniques)
+   - 7.5 [All CLI Arguments](#75-all-cli-arguments)
+8. [Calibration & Evaluation](#8-calibration--evaluation)
+9. [Self-Training Label Refinement](#9-self-training-label-refinement)
+10. [Ensemble Evaluation with TTA](#10-ensemble-evaluation-with-tta)
+11. [Stutter Repair](#11-stutter-repair)
+12. [Pipeline Scripts](#12-pipeline-scripts)
+13. [Tools & Utilities](#13-tools--utilities)
+14. [Tests](#14-tests)
+15. [Constants & Configuration](#15-constants--configuration)
+16. [Directory Structure](#16-directory-structure)
+17. [Training History & Results](#17-training-history--results)
+18. [Troubleshooting](#18-troubleshooting)
 
 ---
 
-## 🗑️ WASTE SCRIPTS - Safe To Delete
+## 1. Project Overview
 
-### ❌ DELETE THIS (Definite Waste)
+AGNI is an end-to-end system for:
 
-**improved_train.py** (388 lines, 13 KB)
-- **Problem:** Redundant old training script
-- **Why waste:** `improved_train_enhanced.py` is better (newer, more features)
-- **Recommendation:** DELETE immediately
-- **Command:** `Remove-Item -Path "d:\Bunny\AGNI\Models\improved_train.py"`
-- **Impact:** -13 KB, cleaner codebase, no confusion
+1. **Detecting** 5 types of stuttering in conversational audio (multi-label classification)
+2. **Repairing** detected stutter regions using spectral inpainting and vocoder-based reconstruction
 
-### ⚠️ KEEP THIS (Optional, Not Waste)
+**Stutter Classes (5):**
 
-**ctc_align.py** (202 lines, 9 KB)
-- **Purpose:** Advanced character-level alignment (optional)
-- **Use:** Only if you need ultra-precise word boundaries
-- **Current:** Using Whisper + energy refinement (sufficient)
-- **Recommendation:** KEEP (might need for production)
-- **Cost:** Only 9 KB
+| Index | Class | Description |
+|-------|-------|-------------|
+| 0 | Prolongation | Extended duration of a sound ("sssssnake") |
+| 1 | Block | Silent pause/stoppage in speech flow |
+| 2 | SoundRep | Sound repetition ("b-b-b-ball") |
+| 3 | WordRep | Word repetition ("I I I want") |
+| 4 | Interjection | Filler words ("um", "uh", "like") |
 
----
+**Approach:** Extract temporal frame-level features from wav2vec2-base (frozen), train a BiLSTM+CNN+Attention classifier, refine noisy labels via self-training, train an ensemble of 3 models with different seeds, apply test-time augmentation, and optimize per-class decision thresholds.
 
-## ⚙️ HOW THE PIPELINE WORKS
+### Key Files
 
-```
-Audio File (WAV/MP3)
-        ↓
-[STEP 1] DETECTION (Sliding-Window CNN)
-  - Scan with 1.0s windows, 0.5s hop
-  - Classify: Prolongation, Block, Sound Rep, Word Rep, Interjection
-        ↓
-[STEP 2] TRANSCRIPTION (Whisper ASR)
-  - Convert speech to text
-  - Generate word-level timestamps
-        ↓
-[STEP 3] MAPPING (Window-to-Word Alignment)
-  - Link detected stutter frames to specific words
-  - Create per-word stutter labels
-        ↓
-[STEP 4] REPAIR (Audio Editing)
-  - Remove: Excise stuttered words
-  - Silence: Replace with quiet
-  - Attenuate: Reduce volume (-10dB) ← DEFAULT
-        ↓
-FINAL OUTPUT
-  ├─ Repaired Audio (WAV file) ✅
-  └─ Diagnostics (JSON report)
-```
+| File | Purpose |
+|------|---------|
+| `Models/extract_wav2vec2_temporal.py` | Temporal wav2vec2 feature extraction (multi-layer weighted average) |
+| `Models/model_temporal_bilstm.py` | Primary model: BiLSTM + Dilated CNN + Multi-Head Attention |
+| `Models/train_90plus_final.py` | Training loop, dataset, augmentation, all techniques (~2039 lines) |
+| `Models/self_train_refine.py` | Self-training label refinement |
+| `Models/ensemble_eval.py` | Ensemble + TTA evaluation |
+| `Models/calibrate_thresholds.py` | Temperature scaling + per-class threshold optimization |
+| `Models/eval_validation.py` | Validation evaluation with AUC/AP curves |
+| `Models/repair_advanced.py` | Vocoder-based stutter repair (725 lines) |
+| `scripts/run_90plus_pipeline.ps1` | Complete 6-step training pipeline |
 
 ---
 
-## 📥 DATA PREPROCESSING
+## 2. System Requirements
 
-### What Does Preprocessing Do?
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| Python | 3.10+ | 3.11 |
+| RAM | 16 GB | 32+ GB |
+| CPU | 4 cores | 8+ threads |
+| Storage | 50 GB free | 100+ GB |
+| GPU | Not required | CUDA GPU for fine-tuning |
+| OS | Windows 10/11 | Any (tested on Windows) |
 
-Preprocessing extracts **Log-Mel spectrograms** from raw audio files, converting them into numerical features that the neural network can learn from. This is a required one-time step before training.
-
-**Input:** Raw audio files (16 kHz WAV format) from `datasets/clips/stuttering-clips/clips/`
-**Output:** Extracted features in `datasets/features/train/` and `datasets/features/val/`
-
-### When to Preprocess?
-
-- ✅ **First time ever** - Before training the model for the first time
-- ✅ **After getting new data** - If you add new audio clips
-- ✅ **After format changes** - If audio sample rate changes
-- ❌ **Not needed** - If you already have `datasets/features/` folder with pre-extracted features
-
-### Step-by-Step Preprocessing
-
-**Quick Check - Do you need to preprocess?**
-
-```powershell
-# If this folder exists with files, preprocessing already done:
-Get-ChildItem "datasets/features/train/" -ErrorAction SilentlyContinue | Measure-Object
-
-# If result shows Count > 100, you're good! Skip preprocessing.
-# If folder empty or doesn't exist, run preprocessing.
-```
-
-**Run Preprocessing:**
-
-```powershell
-# 1. Activate environment first
-cd d:\Bunny\AGNI
-.venv_models\Scripts\Activate.ps1
-
-# 2. Run preprocessing (one-time, ~2 minutes)
-python Models/preprocess_data.py
-
-# Output during processing:
-# ✓ Loading audio files from datasets/clips/
-# ✓ Extracting Log-Mel spectrograms
-# ✓ Splitting into train/val (80/20)
-# ✓ Saving features to datasets/features/train/
-# ✓ Saving features to datasets/features/val/
-# ✓ Done! Total: 24,142 training samples, 6,035 validation samples
-```
-
-### What Gets Created?
-
-After preprocessing, you'll have:
-
-```
-datasets/features/
-├── train/
-│   ├── FluencyBank_010_0.npy (spectrogram features)
-│   ├── FluencyBank_010_1.npy
-│   ├── FluencyBank_010_2.npy
-│   └── ... (24,142 feature files)
-│
-└── val/
-    ├── FluencyBank_015_0.npy (validation set)
-    ├── FluencyBank_015_1.npy
-    └── ... (6,035 feature files)
-```
-
-**Size:** ~2.5 GB total for all extracted features (stored on disk)
-
-### Preprocessing Details
-
-The preprocessing script does the following:
-
-1. **Load Audio:** Read raw WAV files at 16 kHz sample rate
-2. **Extract Mel-Spectrogram:** 
-   - Window: 2048 samples (128ms)
-   - Hop: 512 samples (32ms)
-   - Mel filters: 80 frequency bands
-   - Result: 80 × 256 feature matrix (2.56 seconds of audio)
-3. **Apply Preprocessing:**
-   - Convert to dB scale (log compression)
-   - Normalize globally (mean=0, std=1)
-   - Handle edge cases (clip silence, pad short clips)
-4. **Split Train/Val:**
-   - 80% for training
-   - 20% for validation
-   - Random split to avoid bias
-5. **Save Features:**
-   - Each clip → one NPY file
-   - Preserves original filename (easier tracking)
-   - Ready for immediate model training
-
-### Why Preprocess First?
-
-
-## Implementation Details (Architectures & Scripts)
-
-This section summarizes the main model architectures, training loop, preprocessing, extraction, evaluation, calibration, and repair scripts implemented in the repository. Use this as source content for PPT slides.
-
-- **Model: ImprovedStutteringCNN (Models/model_improved_90plus.py)**
-  - Type: 1D Residual CNN with channel attention
-  - Depth: 8 residual blocks (mix of stride-1 and stride-2 for downsampling)
-  - Channels: starts from input 123 → 64 → 128 → 256 → 512 → ... → 128
-  - Pooling: global avg + max pooled and concatenated (feature dimension 128*2)
-  - Head: FC(256->64) + ReLU + Dropout + FC(64->5) → logits for 5 classes
-  - Regularization: dropout (default 0.4), BatchNorm after convs, residual connections
-  - Attention: lightweight channel attention (two FC layers + sigmoid)
-
-- **Model: CNNBiLSTM (Models/model_cnn_bilstm.py)**
-  - Type: shallow 1D Conv encoder + bidirectional LSTM
-  - Encoder: two Conv1d layers (in->128->128) + BN + ReLU
-  - LSTM: BiLSTM with hidden_size default 256 (returns sequence)
-  - Pooling: mean-pool LSTM outputs over time
-  - Head: Linear(hidden*2 -> 256) + ReLU + Dropout + Linear(256 -> 5)
-  - Good for prototyping / faster runs; lower capacity than ImprovedStutteringCNN
-
-- **Feature extractor: EnhancedAudioPreprocessor (Models/enhanced_audio_preprocessor.py)**
-  - Outputs: 123-channel feature stack: 80 mel + 13 MFCC + 13 delta + 13 delta-delta + 4 spectral features
-  - Robustness: VAD trimming with amplitude fallback, NaN/Inf sanitization, librosa guard + SciPy fallbacks
-  - Quality checks: per-file SNR estimation, silent-channel detection, feature stats collection
-
-- **Extraction orchestrator: Models/extract_features_90plus.py**
-  - Batch extraction with checkpointing, detailed logging, memory & timing diagnostics
-  - Moves corrupted audio to `datasets/corrupted_audio/` and saves NPZs under `datasets/features/{train,val}`
-
-- **Training: Models/train_90plus_final.py**
-  - Features:
-    - Supports 123-channel inputs and 2 model choices (`ImprovedStutteringCNN` or `CNNBiLSTM` via CLI `--arch`)
-    - Augmentations: time/freq masking, noise, time-stretch (robust bounds)
-    - Collate handles variable-length inputs and pads to max length in batch
-    - Mixed precision: `autocast` + `GradScaler` only enabled on CUDA
-    - Gradient accumulation (`--accumulate`), EMA (`--use-ema`), LR scheduler (ReduceLROnPlateau)
-    - Loss: FocalLoss with optional pos_weight OR LabelSmoothingBCELoss
-    - Oversampling: `--oversample rare` uses WeightedRandomSampler (now without replacement) and neutralizes pos_weight to avoid double-upweighting positives
-    - Threshold optimization per epoch and lock/temperature support for calibration
-  - Outputs: checkpoints under `Models/checkpoints/training_<timestamp>/`, metrics JSON and logs under `output/`.
-
-- **Calibration: Models/calibrate_thresholds.py**
-  - Loads checkpoint (auto-detects model class by inspecting keys), gathers logits on validation set, optionally optimizes a single temperature scalar, then searches per-class thresholds to maximize F1.
-  - Output: `output/thresholds.json` with thresholds, per-class F1 metrics, and temperature.
-
-- **Evaluation: Models/eval_validation.py**
-  - Loads a checkpoint (auto-detects model), runs model on validated NPZs, computes per-class AUC and AP, saves histograms, ROC and PR plots to `output/eval_<ckpt>/` and `metrics.json`.
-
-- **Diagnostics: Models/diagnose_best_checkpoint.py**
-  - Uses calibrated thresholds to compute per-class TP/FP/TN/FN and writes `output/diag_<ckpt>/diagnostics.json` with top false-positive and false-negative examples.
-
-- **Repair: Models/repair_advanced.py**
-  - Detect → map → repair flow: runs model detection, uses Whisper ASR for word timestamps, maps detections to words, applies repair (attenuate/silence/remove) with vocoder/SciPy fallbacks.
-  - Conservative repair rules: require per-class threshold + minimum detected region duration (default 0.2s) to avoid over-repairing.
-
-- **Utilities: Models/utils.py**
-  - `FocalLoss` implementation with pos_weight support
-  - Metric helpers and epoch diagnostics saver
-
-## How to reproduce main steps (copyable)
-
-- Extract features (one-time):
-```powershell
-python Models/extract_features_90plus.py --output datasets/features --log-level INFO
-```
-
-- Train (example, CNNBiLSTM run used in recent experiments):
-```powershell
-python Models/train_90plus_final.py --epochs 100 --batch-size 96 --arch cnn_bilstm --oversample rare --auto-calibrate --verbose --num-workers 2 --omp-threads 4 --accumulate 4 --use-ema --sched-patience 5 --early-stop 15
-```
-
-- Calibrate thresholds (explicitly):
-```powershell
-python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features --out output/thresholds.json
-```
-
-- Evaluate checkpoint:
-```powershell
-python Models/eval_validation.py --checkpoint Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features
-```
-
-- Diagnostics (apply calibrated thresholds and list top FP/FN):
-```powershell
-python Models/diagnose_best_checkpoint.py --ckpt Models/checkpoints/<your_ckpt>.pth --data-dir datasets/features --thresholds output/thresholds.json
-```
-
-## Notes, caveats & recommendations
-
-- Environment: prefer a Conda environment on Windows due to librosa/numba/NumPy compatibility (see `requirements_complete.txt`). CPU PyTorch wheel was used in the final runs to avoid DLL issues.
-- If AUC/AP are low for some classes (as seen in the CNNBiLSTM run), try:
-  - A/B test oversampling vs no-oversampling (`--oversample none`) and compare precision/recall.
-  - Train `ImprovedStutteringCNN` for more capacity + attention.
-  - Cap pos_weight when not oversampling (e.g., clip to ≤3) or use `FocalLoss(gamma=1.0)` to reduce false positives.
-  - Tune thresholds using `Models/calibrate_thresholds.py` and use the produced `output/thresholds.json` for inference/repair.
+**Tested Configuration:**
+- Intel i7-1165G7 (4 cores / 8 threads, 2.8 GHz)
+- 40 GB DDR4-3200
+- CPU-only (Intel Iris Xe integrated)
+- Windows, conda env `agni311`
 
 ---
 
-- **Speed:** Extracting spectrograms on-the-fly during training is slow (~2x slower)
-- **Consistency:** All samples use same preprocessing (reproducible results)
-- **Memory:** Features cached on disk, only loaded during training batches
-- **Reusability:** Once extracted, can train multiple model versions without re-extracting
-
-### Full Workflow with Preprocessing
+## 3. Installation & Environment Setup
 
 ```powershell
-# Step 1: Activate environment
-.venv_models\Scripts\Activate.ps1
+# Create conda environment
+conda create -n agni311 python=3.11 -y
+conda activate agni311
 
-# Step 2: PREPROCESS DATA (one-time, ~2 minutes)
-python Models/preprocess_data.py
-# Wait for: "Complete! Extracted features saved."
+# Install PyTorch (CPU)
+pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
 
-# Step 3: TRAIN MODEL (30 epochs, 1-2 hours)
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 64
-# Training automatically uses preprocessed features from datasets/features/
+# Install dependencies
+pip install transformers scipy numpy scikit-learn matplotlib tqdm librosa
 
-# Step 4: TEST DETECTION (10 seconds)
-python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json
-
-# Step 5: REPAIR AUDIO (30-60 seconds per file)
-python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/output.wav --mode attenuate --threshold 0.3
-
-# Done! ✅
+# Note: torchaudio is NOT used (broken on some CPU builds).
+# Audio loading uses scipy.io.wavfile + scipy.signal.resample_poly instead.
 ```
 
-### Troubleshooting Preprocessing
-
-**Problem: "FileNotFoundError: datasets/clips/ not found"**
-```powershell
-# Make sure you have the audio files
-Get-ChildItem "datasets/clips/stuttering-clips/clips/" -First 5
-# Should show: FluencyBank_010_0.wav, FluencyBank_010_1.wav, etc.
-```
-
-**Problem: "Out of memory" during preprocessing**
-```powershell
-# Preprocessing is very memory-efficient, but if it fails:
-# 1. Save current work
-# 2. Restart PC
-# 3. Run: python Models/preprocess_data.py
-```
-
-**Problem: Preprocessing stuck/very slow**
-```powershell
-# Preprocessing should take ~2 minutes max
-# If not progressing after 5 minutes, press Ctrl+C and restart:
-python Models/preprocess_data.py
-```
+See `requirements_complete.txt` for the full pinned dependency list.
 
 ---
 
-## 🎯 EXECUTION ORDER & TIME
+## 4. Dataset
 
-### ONE-TIME SETUP (on your Lenovo ThinkPad T14 Gen 2i: i7-1165G7, 40GB RAM)
-```
-1. Activate environment           < 1 second
-2. Preprocess data               ~2 minutes  ← NEW! Required before training
-3. Train model (30 epochs)       1-2 hours    ← with batch-64 or 96
-4. Done! Ready to use
-```
+**Sources:** SEP-28k + FluencyBank corpora
 
-### REPEATED USAGE (After Model Trained)
-```
-1. Activate environment           < 1 second
-2. Run predict/repair             10-20 seconds
-3. Get results
-```
+| Split | Files | Source |
+|-------|-------|--------|
+| Train | ~25,445 | 80% of labeled clips |
+| Val | ~6,470 | 20% of labeled clips |
+| **Total** | **~31,915** | |
 
-### TYPICAL WORKFLOW
-```
-.venv_models\Scripts\Activate.ps1                              # 1 second
-python Models/preprocess_data.py                               # 2 minutes (first time only)
-python Models/improved_train_enhanced.py --epochs 30 --batch-size 64  # 1-2 HOURS
-python Models/predict_enhanced.py --model enhanced --input ...  # 10 seconds
-python Models/run_asr_map_repair.py --model_path ... --input ... # 10 seconds
-Open output/repaired_audio/*.wav in audio player  # Listen!
-```
+**Raw Audio:** `datasets/clips/stuttering-clips/clips/*.wav` (16 kHz, mono WAV)
 
-### BATCH SIZE OPTIONS
+**Label Sources:**
+- `datasets/SEP-28k_labels.csv` - 3-annotator labels for SEP-28k
+- `datasets/fluencybank_labels.csv` - FluencyBank labels
+- `datasets/SEP-28k_episodes.csv` - Episode metadata
+- `datasets/fluencybank_episodes.csv` - Episode metadata
+- `datasets/label_audio_map.json` - Mapping from label stems to audio file paths
 
-**Your Laptop:** Lenovo ThinkPad T14 Gen 2i (Intel i7-1165G7, 40GB RAM)
+**Labels:** Multi-label binary - each sample can have multiple stutter types simultaneously. Original annotations from 3 annotators are binarized: `value > 0 -> 1.0`.
 
-| Batch Size | Speed | RAM Usage | Training Time | Notes |
-|-----------|-------|-----------|----------------|-------|
-| 32 | Slow | ~10 GB | 2-3 hours | Safe, conservative |
-| **64** | **Fast** | **~19 GB** | **1-2 hours** | ⭐ **RECOMMENDED** |
-| 96 | Very Fast | ~28 GB | 1-1.5 hours | Fast + safe headroom |
-| 128 | Fastest | ~36 GB | 45 min - 1 hour | Max speed, risky |
+**Feature Directories:**
 
-**Recommendation:** Use `--batch-size 64` (1-2 hours) for best balance ✅
+| Directory | Format | Used By |
+|-----------|--------|---------|
+| `datasets/features/{train,val}/*.npz` | `spectrogram (123, T)` + `labels (5,)` | CNN models |
+| `datasets/features_w2v_temporal/{train,val}/*.npz` | `temporal_embedding (768, T)` + `labels (5,)` | BiLSTM/CNN temporal models |
+| `datasets/features_w2v_temporal_refined/{train,val}/*.npz` | Same format, cleaned labels | Stage 2 training |
 
 ---
 
-## **Recent Changes (2026-02-16)**
+## 5. Feature Extraction
 
-- **Stability fixes applied**: threshold search made conservative and smoothed/locked; model depth reduced and Kaiming init applied to avoid training collapse.
-- **Data loader fix**: `Models/train_90plus_final.py` now uses `collate_variable_length` to handle variable-length examples correctly.
-- **Calibration robustness**: `Models/calibrate_thresholds.py` updated to auto-detect model/checkpoint types (CNN vs embedding classifier) and write per-class thresholds JSON.
-- **Embedding support**: `Models/extract_wav2vec_embeddings.py` added/used — it computes mean-pooled wav2vec2 embeddings and writes them back into the same `.npz` files as an `embedding` key (so your features and embeddings live together under `datasets/features/**`). Run with:
+### 5.1. 123-Channel Spectrogram Features
 
+**Script:** `Models/extract_features_90plus.py` (class `FeatureExtractionPipeline`, 1287 lines)
+**Preprocessor:** `Models/enhanced_audio_preprocessor.py` (class `EnhancedAudioPreprocessor`)
+
+Extracts a 123-channel feature stack from raw audio:
+
+| Channels | Feature | Library |
+|----------|---------|---------|
+| 0-79 (80) | Mel spectrogram | librosa / SciPy fallback |
+| 80-92 (13) | MFCCs | DCT of mel spectrogram |
+| 93-105 (13) | MFCC deltas | 1st derivative |
+| 106-118 (13) | MFCC delta-deltas | 2nd derivative |
+| 119 (1) | Spectral centroid | Frequency-weighted mean |
+| 120 (1) | Spectral rolloff | 85th percentile frequency |
+| 121 (1) | Zero-crossing rate | Sign changes per frame |
+| 122 (1) | Spectral flux | Frame-to-frame magnitude change |
+
+**Parameters:**
+- Sample rate: 16,000 Hz
+- FFT size: 1024
+- Hop length: 512
+- Mel bands: 80
+- MFCCs: 13
+
+**Processing Pipeline:**
+1. Load WAV -> resample to 16 kHz -> mono
+2. VAD trimming (amplitude-based fallback)
+3. STFT -> mel spectrogram -> MFCCs -> deltas -> spectral features
+4. NaN/Inf sanitization
+5. Save as NPZ: `spectrogram (123, T)` + `labels (5,)`
+
+**Usage:**
 ```powershell
-python Models/extract_wav2vec_embeddings.py --workers 4
+python Models/extract_features_90plus.py
 ```
 
-- **Embedding classifier & PEFT**: Added an `emb_classifier` scaffold and patched `Models/finetune_wav2vec_peft.py` to be runnable. The finetune script now accepts `--gradient_accumulation_steps` and `--fp16` and contains a simple dataset mapping template. Example run (online):
+### 5.2. Temporal wav2vec2 Features (Primary)
 
-```powershell
-python Models/finetune_wav2vec_peft.py --model_name facebook/wav2vec2-base-960h --output_dir Models/checkpoints/peft --per_device_train_batch_size 2 --learning_rate 1e-4 --num_train_epochs 10 --gradient_accumulation_steps 8 --use_lora --fp16
+**Script:** `Models/extract_wav2vec2_temporal.py`
+**Model:** `facebook/wav2vec2-base` (HuggingFace, 94M parameters, frozen)
+
+Extracts temporal frame-level features from wav2vec2's transformer encoder using a multi-layer weighted average.
+
+**Audio Loading (scipy-based - no torchaudio):**
+```python
+scipy.io.wavfile.read()          # Load WAV
+scipy.signal.resample_poly()     # Resample to 16kHz
+# int16/int32/float64 -> float32, stereo -> mono
 ```
 
-- **Offline / network notes**: If Hugging Face downloads fail (corporate firewall), either pre-cache the model on a machine with internet and copy into `Models/hf_cache/facebook/wav2vec2-base-960h`, or use the local path with `--model_name Models/hf_cache/facebook/wav2vec2-base-960h` when running the finetune script.
+**Multi-Layer Weighted Average (layers 7-12):**
 
-- **Quick run order (recommended)**:
+The top 6 transformer layers are combined with learned-prior weights:
 
-```powershell
-# 1) (one-time) ensure venv and dependencies installed
-.venv_models\Scripts\Activate.ps1
-python -m pip install -r requirements_complete.txt
+| Layer | Raw Weight | Normalized | Rationale |
+|-------|-----------|------------|-----------|
+| 7 | 0.10 | ~0.10 | Lower-level acoustic |
+| 8 | 0.12 | ~0.12 | |
+| 9 | 0.15 | ~0.15 | Mid-level features |
+| 10 | 0.18 | ~0.18 | |
+| 11 | 0.20 | ~0.20 | Higher-level linguistic |
+| 12 | 0.25 | ~0.25 | Most task-relevant |
 
-# 2) (optional) extract wav2vec embeddings into .npz files
-python Models/extract_wav2vec_embeddings.py --workers 4
+**Implementation:**
+```python
+model.config.output_hidden_states = True
+outputs = model(input_values)
+hidden_states = outputs.hidden_states  # tuple of 13 tensors (embedding + 12 layers)
 
-# 3) baseline feature-based training (offline)
-python Models/train_90plus_final.py --train --epochs 60 --batch_size 64
-
-# 4) calibrate thresholds from a saved checkpoint
-python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/best_checkpoint.pth --output thresholds.json
-
-# 5) (optional) PEFT/LoRA fine-tune wav2vec2 (requires HF model cached or network)
-python Models/finetune_wav2vec_peft.py --model_name facebook/wav2vec2-base-960h --output_dir Models/checkpoints/peft --per_device_train_batch_size 2 --learning_rate 1e-4 --num_train_epochs 10 --gradient_accumulation_steps 8 --use_lora --fp16
-
-# 6) evaluate & run repair
-python Models/AGNI_TRAIN_AND_TEST.py --evaluate --checkpoint <best_checkpoint>
-python Models/run_asr_map_repair.py --model_path <best_checkpoint> --input_file some.wav --output_file output/repaired.wav --threshold_file thresholds.json --mode attenuate
+# Weighted combination of layers 7-12
+layer_weights = {7: 0.10, 8: 0.12, 9: 0.15, 10: 0.18, 11: 0.20, 12: 0.25}
+weighted_sum = sum(w * hidden_states[layer] for layer, w in layer_weights.items())
+weighted_avg = weighted_sum / sum(layer_weights.values())
 ```
 
-If you want, I can commit these steps into a `scripts/run_full_pipeline.sh` (or PowerShell) to automate the sequence — tell me "create run script" and I'll add it.
+**Output Format:**
+```
+datasets/features_w2v_temporal/{train,val}/<clip_id>.npz
+  +-- temporal_embedding: float32 (768, T)   # T <= 200 frames (~4s at 50fps)
+  +-- labels:             float32 (5,)       # Binary stutter labels
+```
 
-## **Assistant Updates (2026-02-18)**
+**Label Loading:** Uses a pickle cache (`datasets/features/_label_cache.pkl`) to avoid re-reading 31k+ NPZ files for label extraction. Cache is auto-built on first run.
 
-- **Files added or modified by the assistant:**
-  - `Models/calibrate_thresholds.py` — new script to sweep per-class decision thresholds on the validation set and write `output/thresholds.json`.
-  - `Models/model_cnn_bilstm.py` — CNN → BiLSTM prototype model added for temporal experiments (selectable via `--arch cnn_bilstm`).
-  - `Models/augment_repetitions.py` — augmentation helper to synthesize repeated-word examples for the rare `Word Repetition` class.
-  - `Models/repair_advanced.py` — patched to include a `librosa` guard and SciPy fallbacks, to load `output/thresholds.json` if present, and to apply a conservative per-class threshold + minimum-duration (default 0.2s) before performing repairs.
-  - `Models/train_90plus_final.py` — added `--arch` and `--oversample` flags and sampler support for rare-class oversampling.
-  - `Models/COMPLETE_PIPELINE.py` — reduced import noise and wired repair to honor the thresholds file when available.
+**CLI Arguments:**
+```
+--model          facebook/wav2vec2-base    # HuggingFace model name
+--clips-dir      datasets/clips/...       # Raw audio directory
+--features-dir   datasets/features        # Source for labels + train/val split
+--output-dir     datasets/features_w2v_temporal
+--max-frames     200                      # Max temporal frames (truncate/pad)
+--batch-size     8                        # Inference batch size
+--layer-mode     weighted-avg             # 'weighted-avg' or 'last'
+```
 
-- **Behavior & usage notes:**
-  - Calibration produces `output/thresholds.json`. Run calibration with:
+**CPU Optimization:**
+```python
+torch.set_num_threads(os.cpu_count())      # All logical CPUs
+torch.set_num_interop_threads(os.cpu_count())
+os.environ['OMP_NUM_THREADS'] = str(N_CORES)
+os.environ['MKL_NUM_THREADS'] = str(N_CORES)
+```
 
-    ```powershell
-    python Models/calibrate_thresholds.py --checkpoint Models/checkpoints/training_20260217_013705/improved_90plus_best.pth --data-dir datasets/features --output output/thresholds.json
-    ```
+**Resumable:** Skips already-extracted files (checks for existing `.npz`).
 
-  - The repair module now uses conservative rules: a detection must exceed its per-class threshold (from `output/thresholds.json`) and the detected region must be at least 0.2s long before repair is attempted. This reduces over-repairing.
+---
 
-  - To run detection+repair using the calibrated thresholds (pipeline will auto-detect `output/thresholds.json` if present):
+## 6. Model Architectures
 
-    ```powershell
-    python Models/COMPLETE_PIPELINE.py --repair-only --test-file "path\to\audio.mp3" --threshold-file output/thresholds.json --mode attenuate
-    ```
+### 6.1. TemporalBiLSTMClassifier (Primary - 2.07M params)
 
-  - These edits were implemented to keep the pipeline functional without changing the host environment (SciPy fallbacks used when `librosa`/`numba` are incompatible).
+**File:** `Models/model_temporal_bilstm.py`
+**Architecture choice:** `--arch temporal_bilstm`
 
-## 📊 REPAIR MODES (Choose One)
+The strongest model. Combines BiLSTM sequential modeling with dilated CNNs for multi-scale temporal patterns and multi-head attention pooling with per-class specialization.
 
-```powershell
---mode attenuate    ← RECOMMENDED (Most Natural)
-  Effect: Reduce stuttered word volume by 10dB
-  Sound: Natural, preserves context
-  Use: Default, safest choice
-  Example: "I c-c-c-can't" → "I [quieter] can't"
-  
---mode silence      (Alternative)
-  Effect: Replace with silence
-  Sound: Clear but may sound choppy
-  Use: When obvious removal needed
-  Example: "I c-c-c-can't" → "I [pause] can't"
-  
---mode remove       (Aggressive)
-  Effect: Excise words, stitch audio
-  Sound: Very choppy, unnatural gaps
-  Use: Only for complete removal
-  Example: "I c-c-c-can't" → "I can't"
+**Constructor:**
+```python
+TemporalBiLSTMClassifier(
+    input_dim=768,      # wav2vec2 feature dim
+    n_classes=5,        # Number of stutter types
+    hidden_dim=256,     # CNN hidden dimension
+    lstm_hidden=128,    # LSTM hidden size (x2 for bidirectional)
+    lstm_layers=2,      # LSTM depth
+    dropout=0.3         # Dropout rate
+)
+```
+
+**Complete Layer Table:**
+
+| # | Layer | Type | Dimensions | Notes |
+|---|-------|------|------------|-------|
+| 1 | `proj.0` | Conv1d | 768 -> 256, k=1 | Projection, no bias |
+| 2 | `proj.1` | BatchNorm1d | 256 | |
+| 3 | `proj.2` | GELU | - | |
+| 4 | `proj.3` | Dropout | 0.15 | |
+| 5 | `lstm` | LSTM | input=256, hidden=128, layers=2, bidirectional=True | Output: 256 (128x2) |
+| 6 | `lstm_norm` | LayerNorm | 256 | Post-LSTM normalization |
+| 7 | `lstm_drop` | Dropout | 0.3 | |
+| 8 | `temporal_blocks.0` | ConvBlock | 256 -> 256, k=3, dilation=1 | Residual + BN + GELU |
+| 9 | `temporal_blocks.1` | ConvBlock | 256 -> 256, k=3, dilation=2 | Receptive field grows |
+| 10 | `temporal_blocks.2` | ConvBlock | 256 -> 256, k=3, dilation=4 | |
+| 11 | `wide_conv.0` | Conv1d | 256 -> 128, k=7, pad=3 | Wide kernel path |
+| 12 | `wide_conv.1` | BatchNorm1d | 128 | |
+| 13 | `wide_conv.2` | GELU | - | |
+| 14 | `wide_conv.3` | Dropout | 0.3 | |
+| 15 | `fusion.0` | Conv1d | 384 -> 256, k=1 | Merge dilated + wide |
+| 16 | `fusion.1` | BatchNorm1d | 256 | |
+| 17 | `fusion.2` | GELU | - | |
+| 18 | `fusion.3` | Dropout | 0.3 | |
+| 19 | `attention_pool` | MultiHeadAttentionPool | 5 heads, each: Linear(256->64)->Tanh->Linear(64->1) | 1 head per class |
+| 20-24 | `class_heads[0-4]` | Sequential x 5 | Linear(256->64)->GELU->Dropout(0.15)->Linear(64->1) | Per-class output |
+
+**Each ConvBlock contains:**
+```
+Conv1d(C_in, C_out, kernel=3, dilation=d, padding=d, bias=False)
+-> BatchNorm1d(C_out)
+-> GELU
+-> Dropout(0.3)
++ Residual skip (1x1 Conv1d if C_in != C_out)
+```
+
+**Forward Pass Flow:**
+```
+Input: (B, 768, T)
+  |
+  +-- 1. Conv1d projection -> (B, 256, T)
+  |
+  +-- 2. Transpose -> (B, T, 256) -> BiLSTM -> (B, T, 256)
+  |     -> LayerNorm -> Dropout -> Transpose -> (B, 256, T)
+  |
+  +-- 3. Dilated ConvBlocks (d=1,2,4) -> h_temporal (B, 256, T)
+  |
+  +-- 4. Wide Conv (k=7) on LSTM output -> h_wide (B, 128, T)
+  |
+  +-- 5. Concatenate [h_temporal, h_wide] -> (B, 384, T) -> Fusion -> (B, 256, T)
+  |
+  +-- 6. Multi-Head Attention Pool (5 heads, 1 per class) -> 5x (B, 256)
+  |
+  +-- 7. Per-class heads -> (B, 5) logits
+```
+
+**Weight Initialization:**
+- LSTM `weight_ih`: Xavier uniform
+- LSTM `weight_hh`: Orthogonal
+- LSTM forget gate bias: 1.0 (encourages remembering)
+- Conv1d: Kaiming normal
+- Linear: Xavier normal
+- BatchNorm: weight=1, bias=0
+
+**Unique checkpoint keys:** `lstm_norm.weight`, `lstm_norm.bias` (used for architecture auto-detection)
+
+---
+
+### 6.2. TemporalStutterClassifier (870K params)
+
+**File:** `Models/model_temporal_w2v.py`
+**Architecture choice:** `--arch temporal_w2v`
+
+Lighter alternative without LSTM - pure dilated CNN.
+
+**Constructor:**
+```python
+TemporalStutterClassifier(input_dim=768, n_classes=5, hidden_dim=256, dropout=0.3)
+```
+
+**Layer Table:**
+
+| # | Layer | Type | Dimensions |
+|---|-------|------|------------|
+| 1 | `proj.0` | Conv1d | 768 -> 256, k=1, no bias |
+| 2 | `proj.1` | BatchNorm1d | 256 |
+| 3 | `proj.2` | GELU | - |
+| 4 | `temporal_blocks.0` | ConvBlock | 256 -> 256, k=3, dil=1 |
+| 5 | `temporal_blocks.1` | ConvBlock | 256 -> 256, k=3, dil=2 |
+| 6 | `temporal_blocks.2` | ConvBlock | 256 -> 256, k=3, dil=4 |
+| 7-10 | `wide_conv` | Conv1d+BN+GELU+Drop | 256 -> 128, k=7, pad=3 |
+| 11-14 | `fusion` | Conv1d+BN+GELU+Drop | 384 -> 256, k=1 |
+| 15 | `attention_pool` | AttentionPool | Linear(256->64)->Tanh->Linear(64->1) |
+| 16-20 | `class_heads[0-4]` | Sequential x 5 | 256->64->GELU->Drop(0.15)->64->1 |
+
+**Forward:** Same as BiLSTM model but without the LSTM stage - goes directly from projection to dilated ConvBlocks.
+
+**Receptive field:** 15 frames = ~300ms at 50fps wav2vec2 output rate.
+
+---
+
+### 6.3. CNNBiLSTM (Baseline)
+
+**File:** `Models/model_cnn_bilstm.py`
+**Architecture choice:** `--arch cnn_bilstm`
+
+Simple baseline CNN + BiLSTM for 123-channel spectrogram features.
+
+**Constructor:**
+```python
+CNNBiLSTM(in_channels=123, cnn_out=128, lstm_hidden=256, n_classes=5, num_layers=1, dropout=0.3)
+```
+
+**Layer Table:**
+
+| # | Layer | Type | Dimensions |
+|---|-------|------|------------|
+| 1 | `conv1` | Conv1d | 123 -> 128, k=5, pad=2 |
+| 2 | `bn1` | BatchNorm1d | 128 |
+| 3 | `conv2` | Conv1d | 128 -> 128, k=5, pad=2 |
+| 4 | `bn2` | BatchNorm1d | 128 |
+| 5 | `lstm` | LSTM | input=128, hidden=256, layers=1, bidirectional=True |
+| 6 | `classifier.0` | Linear | 512 -> 256 |
+| 7 | `classifier.1` | ReLU | - |
+| 8 | `classifier.2` | Dropout | 0.3 |
+| 9 | `classifier.3` | Linear | 256 -> 5 |
+
+**Forward:** Conv1->ReLU->BN->Conv2->ReLU->BN->permute->LSTM->mean pool->classifier
+
+---
+
+### 6.4. ImprovedStutteringCNN
+
+**File:** `Models/model_improved_90plus.py`
+**Architecture choice:** `--arch improved_90plus`
+
+8-block residual CNN with squeeze-excitation attention.
+
+**Constructor:**
+```python
+ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
+```
+
+**Residual Blocks (each: 2x Conv1d + BN + Dropout + skip connection):**
+
+| Block | In -> Out | Stride |
+|-------|----------|--------|
+| 1 | 123 -> 64 | 1 |
+| 2 | 64 -> 128 | 2 |
+| 3 | 128 -> 256 | 1 |
+| 4 | 256 -> 256 | 2 |
+| 5 | 256 -> 512 | 2 |
+| 6 | 512 -> 512 | 1 |
+| 7 | 512 -> 256 | 1 |
+| 8 | 256 -> 128 | 1 |
+
+**Classifier Head:**
+- `AttentionBlock(128)`: SE attention with reduction=16 -> Linear(128->8)->ReLU->Linear(8->128)->Sigmoid
+- AdaptiveAvgPool1d + AdaptiveMaxPool1d -> concatenate -> `(B, 256)`
+- Linear(256->64) -> ReLU -> Dropout(0.4) -> Linear(64->5)
+
+---
+
+### 6.5. ImprovedStutteringCNNLarge
+
+**File:** `Models/model_improved_90plus_large.py`
+**Architecture choice:** `--arch improved_90plus_large`
+
+Largest model. Multi-scale dilated entry, SE-augmented ResBlocks, Transformer encoder, AttentivePooling, per-class heads.
+
+**Constructor:**
+```python
+ImprovedStutteringCNNLarge(n_channels=123, n_classes=5, dropout=0.35, d_model=256)
+```
+
+**Multi-Scale Entry (3 parallel dilated convolutions):**
+- Conv1d(123->64, k=3, dil=1) + BN + ReLU
+- Conv1d(123->64, k=3, dil=2) + BN + ReLU
+- Conv1d(123->64, k=3, dil=4) + BN + ReLU
+- Fuse: Conv1d(192->256, k=1) + BN + ReLU
+
+**8 SE-ResidualBlocks (each includes SEBlock with reduction=8):**
+
+| Block | In -> Out | Stride |
+|-------|----------|--------|
+| 1 | 256 -> 160 | 1 |
+| 2 | 160 -> 320 | 2 |
+| 3 | 320 -> 640 | 1 |
+| 4 | 640 -> 640 | 2 |
+| 5 | 640 -> 1280 | 2 |
+| 6 | 1280 -> 1280 | 1 |
+| 7 | 1280 -> 640 | 1 |
+| 8 | 640 -> 320 | 1 |
+
+**Post-blocks:**
+- AttentionBlock(320)
+- Conv1d projection: 320 -> 256
+- TransformerEncoder: 1 layer, d_model=256, nhead=4, dim_ff=512, dropout=0.35
+- AttentionPool: learned query-key dot-product (attn_dim=128)
+- 5x class heads: Linear(256->64)->ReLU->Dropout->Linear(64->1)
+
+---
+
+### 6.6. ImprovedStutteringCNNLargeSE
+
+**File:** `Models/model_improved_90plus_se.py`
+**Architecture choice:** `--arch improved_90plus_se`
+
+SE-enhanced variant with larger channel widths.
+
+**Constructor:**
+```python
+ImprovedStutteringCNNLargeSE(n_channels=123, n_classes=5, dropout=0.35)
+```
+
+**8 ResidualBlockSE blocks (SEBlock reduction=16):**
+
+| Block | In -> Out | Stride |
+|-------|----------|--------|
+| 1 | 123 -> 128 | 1 |
+| 2 | 128 -> 256 | 2 |
+| 3 | 256 -> 512 | 1 |
+| 4 | 512 -> 512 | 2 |
+| 5 | 512 -> 1024 | 2 |
+| 6 | 1024 -> 1024 | 1 |
+| 7 | 1024 -> 512 | 1 |
+| 8 | 512 -> 256 | 1 |
+
+**Head:** AttentionBlock(256) -> avg+max pool -> cat -> Linear(512->128)->ReLU->Dropout->Linear(128->5)
+
+---
+
+## 7. Training System
+
+**File:** `Models/train_90plus_final.py` (~2039 lines)
+
+### 7.1. Data Loading & Augmentation
+
+**`AudioDataset` class** - Supports 3 data formats:
+
+| Format | NPZ Key | Shape | Used By |
+|--------|---------|-------|---------|
+| Temporal wav2vec2 | `temporal_embedding` | `(768, T)` | BiLSTM, temporal CNN |
+| Embedding | `embedding` | `(D,)` e.g. 1536 | MLP |
+| Spectrogram | `spectrogram` | `(123, T)` | CNN models |
+
+**Preprocessing per format:**
+- **Temporal:** Per-channel z-score normalization. Time masking augmentation (masks up to 20% of frames with zeros).
+- **Spectrogram:** Full augmentation pipeline (see below) + per-channel z-score normalization.
+- **Labels:** Binarized: `value > 0 -> 1.0`
+
+**`AudioAugmentation` class** - Augmentations applied independently with individual probabilities:
+
+| Augmentation | Default Prob | Method |
+|-------------|-------------|--------|
+| Time masking | 0.6 | Masks up to 30% of time frames with channel mean |
+| Frequency masking | 0.5 | Masks up to 20% of frequency bins with channel mean |
+| Gaussian noise | 0.4 | Additive, sigma = 0.01 |
+| SNR noise | 0.25 | Random SNR 10-30 dB |
+| Pitch shift | 0.25 | Roll frequency axis +/-5% bins |
+| Time stretch | 0.25 | Interpolate to factor 0.95-1.05 |
+
+All augmentation probabilities are independently configurable via CLI (`--aug-time-p`, `--aug-freq-p`, etc.).
+
+**`collate_variable_length` function** - Pads variable-length 2D features `(C, T)` to max time dimension in batch using `torch.nn.functional.pad`. Handles 1D, 2D, and 3D tensor inputs.
+
+**MixUp Augmentation** - Applied at batch level during training:
+```python
+# Beta distribution sampling
+lam = np.random.beta(alpha, alpha)
+idx = torch.randperm(batch_size)
+mixed_x = lam * x + (1 - lam) * x[idx]
+mixed_y = lam * y + (1 - lam) * y[idx]
+```
+
+### 7.2. Loss Functions
+
+**`FocalLoss`** (default, from `Models/utils.py`):
+```
+loss = BCE(logits, targets) * (1 - p_t)^gamma * alpha
+```
+- `gamma`: 2.0 (default) - focuses on hard examples
+- `alpha`: 1.0
+- `pos_weight`: Auto-computed per class as `neg_count / pos_count`, clipped to [1.0, 50.0]
+
+**`LabelSmoothingBCELoss`:**
+```
+smoothed_target = target * (1 - smoothing) + 0.5 * smoothing
+loss = BCE(logits, smoothed_target)
+```
+- `smoothing`: 0.05-0.1
+
+**`BCEWithLogitsLoss`:** Standard binary cross-entropy with optional `pos_weight`.
+
+### 7.3. Optimizers & Schedulers
+
+**Optimizer:** AdamW
+
+| Parameter | Default | Pipeline Config |
+|-----------|---------|-----------------|
+| Learning rate | 1e-4 | 3e-4 |
+| Weight decay | 1e-5 | 5e-4 |
+| Betas | (0.9, 0.999) | default |
+
+**Schedulers:**
+
+| Type | Configuration | When |
+|------|--------------|------|
+| `reduce` (default) | ReduceLROnPlateau(mode='max', factor=0.5, patience=7) | Reduces LR when val F1 plateaus |
+| `cosine` | 3-epoch LinearLR warmup -> CosineAnnealingLR(T_max=epochs-3, eta_min=1e-6) | Smooth decay |
+| `onecycle` | OneCycleLR with `--max-lr` | Aggressive warmup + annealing |
+
+**LR Warmup:** For `reduce` scheduler, manual linear warmup over 3 epochs from 1% -> 100% of target LR.
+
+### 7.4. Training Techniques
+
+| Technique | Implementation | CLI Flag |
+|-----------|---------------|----------|
+| **Focal Loss** | Downweights easy examples via (1-p)^gamma | `--focal-gamma 2.0` |
+| **Label Smoothing** | Smooths binary targets toward 0.5 | `--use-label-smoothing --label-smoothing 0.05` |
+| **MixUp** | Beta-distribution interpolation of inputs/labels | `--mixup-alpha 0.2` |
+| **Oversampling** | WeightedRandomSampler with inverse-frequency weights | `--oversample rare` |
+| **SWA** | Stochastic Weight Averaging via `torch.optim.swa_utils` | `--use-swa --swa-start 60 --swa-lr 1e-5` |
+| **EMA** | Exponential Moving Average of model weights | `--use-ema --ema-decay 0.999` |
+| **Gradient Clipping** | `torch.nn.utils.clip_grad_norm_` | `--grad-clip 1.0` |
+| **Gradient Accumulation** | Accumulates gradients over N batches | `--accumulate N` |
+| **Threshold Optimization** | Per-class F1 grid search every epoch [0.25, 0.85] step 0.025 | `--save-thresholds` |
+| **Mixed Precision (AMP)** | `torch.cuda.amp.GradScaler` - CUDA only | Automatic on GPU |
+| **Layer Freezing** | Freeze layers by prefix for N epochs, then unfreeze | `--freeze-prefix --freeze-epochs` |
+| **IPEX** | Intel Extension for PyTorch optimization | `--device ipex` |
+| **DirectML** | AMD/Intel GPU via DirectML | `--device dml` |
+| **Early Stopping** | Stops when val F1 hasn't improved for N epochs | `--early-stop 25` |
+| **Deterministic Seeds** | Sets Python, NumPy, Torch random seeds | `--seed 42` |
+
+**SWA Details:**
+```python
+swa_model = torch.optim.swa_utils.AveragedModel(model)
+swa_scheduler = torch.optim.swa_utils.SWALR(optimizer, swa_lr=1e-5)
+# Starts averaging at epoch --swa-start
+# Final: update_bn(train_loader, swa_model) to fix BatchNorm stats
+```
+
+**Class Weight Computation:**
+```python
+pos_weight[c] = clamp(neg_count[c] / pos_count[c], min=1.0, max=50.0)
+# Neutralized to 1.0 when --oversample is used (avoids double-upweighting)
+```
+
+**Checkpointing:** Full state dict saved every epoch:
+```python
+{
+    'model_state_dict': ...,
+    'optimizer_state_dict': ...,
+    'scheduler_state_dict': ...,
+    'scaler_state_dict': ...,      # AMP scaler (CUDA only)
+    'ema_shadow': ...,             # EMA weights
+    'rng_states': {                # For exact reproducibility
+        'python': ...,
+        'numpy': ...,
+        'torch': ...,
+        'cuda': ...
+    },
+    'epoch': ...,
+    'best_f1': ...,
+    'metrics': ...
+}
+```
+
+### 7.5. All CLI Arguments
+
+```
+Training Arguments:
+  --epochs              60          Number of training epochs
+  --batch-size          64          Batch size
+  --data-dir            datasets/features    Feature directory
+  --lr                  1e-4        Learning rate
+  --weight-decay        1e-5        AdamW weight decay
+  --dropout             0.2         Model dropout rate
+  --grad-clip           1.0         Max gradient norm
+  --seed                None        Random seed for reproducibility
+  --resume              None        Resume from checkpoint path
+
+Architecture:
+  --arch                improved_90plus    Model architecture
+      choices: improved_90plus, improved_90plus_large, improved_90plus_se,
+               cnn_bilstm, embedding_mlp, temporal_w2v, temporal_bilstm
+
+Loss & Regularization:
+  --focal-gamma         2.0         Focal loss gamma
+  --loss-type           None        focal / bce / label_smoothing
+  --use-label-smoothing False       Enable label smoothing
+  --label-smoothing     0.1         Smoothing factor
+  --use-bce             False       Use plain BCE loss
+  --neutral-pos-weight  False       Set all pos_weight to 1.0
+
+Augmentation:
+  --mixup-alpha         0.0         MixUp alpha (0 = disabled)
+  --aug-time-p          None        Time masking probability
+  --aug-freq-p          None        Frequency masking probability
+  --aug-noise-p         None        Gaussian noise probability
+  --aug-stretch-p       None        Time stretch probability
+  --aug-pitch-p         None        Pitch shift probability
+  --aug-snr-p           None        SNR noise probability
+
+Scheduler:
+  --scheduler           reduce      reduce / onecycle / cosine
+  --max-lr              None        Max LR for OneCycleLR
+  --sched-patience      None        ReduceLROnPlateau patience
+
+Training Techniques:
+  --use-swa             False       Enable Stochastic Weight Averaging
+  --swa-start           80          Epoch to start SWA
+  --swa-lr              1e-5        SWA learning rate
+  --use-ema             False       Enable EMA
+  --ema-decay           0.999       EMA decay factor
+  --accumulate          1           Gradient accumulation steps
+  --oversample          none        none / rare / weight
+  --sampler-replacement False       Sample with replacement
+  --early-stop          None        Early stopping patience
+  --freeze-prefix       None        Layer name prefix to freeze
+  --freeze-up-to        None        Freeze layers up to this name
+  --freeze-epochs       None        Unfreeze after N epochs
+
+Calibration & Thresholds:
+  --auto-calibrate      False       Auto-calibrate thresholds
+  --save-thresholds     False       Save per-class thresholds
+  --thresh-min-precision 0.2        Minimum precision for thresholds
+
+System:
+  --gpu                 True        Use GPU if available
+  --device              auto        auto / cpu / cuda / dml / ipex
+  --num-workers         2           DataLoader worker processes
+  --omp-threads         4           OpenMP threads
+  --verbose             False       Extra logging
 ```
 
 ---
 
-## 📁 FILE STRUCTURE
+## 8. Calibration & Evaluation
+
+### Threshold Calibration
+
+**File:** `Models/calibrate_thresholds.py`
+
+Two-stage calibration on validation data:
+
+1. **Temperature Scaling:** Learns a single scalar temperature T to calibrate predicted probabilities:
+   ```
+   calibrated_logits = logits / T
+   ```
+   Optimized via Adam (lr=0.01, 300 steps) on BCE NLL. Temperature clamped to [0.05, 10.0].
+
+2. **Per-Class Threshold Search:** After temperature scaling, grid-searches optimal threshold per class:
+   ```
+   search range: [0.01, 0.99], step 0.01
+   metric: per-class F1 score
+   ```
+
+**Output:** `output/thresholds.json`
+```json
+{
+    "thresholds": [0.45, 0.48, 0.52, 0.38, 0.41],
+    "per_class_metrics": { "..." : "..." },
+    "temperature": 1.23
+}
+```
+
+Auto-detects 7 model architectures from checkpoint state dict keys:
+- `lstm_norm.` -> TemporalBiLSTMClassifier
+- `proj.` + `temporal_blocks.` -> TemporalStutterClassifier
+- `ms_conv1.` -> ImprovedStutteringCNNLarge
+- `block1.se.` -> ImprovedStutteringCNNLargeSE
+- `block1.conv1.` -> ImprovedStutteringCNN
+- `conv1.` + `lstm.` -> CNNBiLSTM
+
+### Validation Evaluation
+
+**File:** `Models/eval_validation.py`
+
+Loads checkpoint + val data, computes:
+- Per-class AUC-ROC and Average Precision
+- Generates plots: ROC curves, PR curves, probability histograms, confusion matrices
+- Writes `metrics.json` with all results
+
+**Output:** `output/eval_<model_name>/`
+
+---
+
+## 9. Self-Training Label Refinement
+
+**File:** `Models/self_train_refine.py`
+
+Uses a trained model's confident predictions to fix noisy labels in the training data. Addresses the ~20% inter-annotator disagreement in SEP-28k.
+
+**Algorithm:**
+```
+For each sample (feature, label) in train and val:
+    prediction = model(feature)  # sigmoid probability
+
+    For each class c:
+        if prediction[c] > confidence_high (0.90) AND label[c] == 0:
+            -> Flip label to 1  (model is confident this IS present)
+
+        if prediction[c] < confidence_low (0.10) AND label[c] == 1:
+            -> Flip label to 0  (model is confident this is NOT present)
+
+    Save feature (unchanged) + refined label to output directory
+```
+
+**CLI:**
+```
+--checkpoint        Path to trained model checkpoint
+--data-dir          Input feature directory
+--output-dir        Output directory for refined features
+--confidence-high   0.90    Threshold for flipping 0->1
+--confidence-low    0.10    Threshold for flipping 1->0
+```
+
+Reports per-class flip statistics (how many labels were changed in each direction).
+
+---
+
+## 10. Ensemble Evaluation with TTA
+
+**File:** `Models/ensemble_eval.py`
+
+Combines three techniques for maximum accuracy:
+
+### Multi-Model Ensemble
+Loads N model checkpoints (trained with different seeds), averages their predicted probabilities:
+```python
+avg_probs = mean([model_1(x), model_2(x), model_3(x)])
+```
+
+### Test-Time Augmentation (TTA)
+For each sample, creates N time-shifted versions via circular shift, averages predictions:
+```python
+def tta_predict(model, x, n_shifts=5):
+    preds = [model(x)]  # Original
+    for i in range(n_shifts):
+        shift = (i + 1) * (T // (n_shifts + 1))
+        x_shifted = torch.roll(x, shifts=shift, dims=-1)  # Circular
+        preds.append(model(x_shifted))
+    return mean(preds)
+```
+
+### Per-Class Threshold Optimization
+Grid search on [0.1, 0.9] step 0.01 to maximize F1 per class.
+
+**CLI:**
+```
+--checkpoints    Path(s) to model checkpoints (nargs +)
+--data-dir       Feature directory
+--tta-shifts     5       Number of TTA time shifts
+--output-dir     output/ensemble_eval
+```
+
+**Output:**
+- `ensemble_results.json` - Full metrics, per-class F1, macro F1, AUC
+- `ensemble_thresholds.json` - Optimized thresholds (also copied to `output/thresholds.json`)
+
+---
+
+## 11. Stutter Repair
+
+**File:** `Models/repair_advanced.py` (725 lines)
+**Class:** `AdvancedStutterRepair`
+
+Detects stutter regions in audio using the trained model, then repairs them using:
+
+1. **Phase reconstruction** - Griffin-Lim algorithm or phase vocoder
+2. **Spectral inpainting** - Interpolates magnitude spectrum across stutter boundaries
+3. **Vocoder reconstruction** - Synthesizes clean speech from modified spectral representation
+
+Falls back to SciPy-only processing when librosa is unavailable.
+
+---
+
+## 12. Pipeline Scripts
+
+### Main Pipeline: `scripts/run_90plus_pipeline.ps1` (345 lines)
+
+The complete 6-step training pipeline:
 
 ```
-d:\Bunny\AGNI\
-│
-├── README.md ← YOU ARE HERE
-│
-├── Models/
-│   ├── preprocess_data.py ⭐ DATA PREPROCESSING (Run First!)
-│   ├── improved_train_enhanced.py ⭐ TRAINING
-│   ├── predict_enhanced.py ⭐ TESTING
-│   ├── run_asr_map_repair.py ⭐ REPAIR+PIPELINE
-│   │
-│   ├── model_enhanced.py, model_cnn.py (REQUIRED)
-│   ├── features.py, asr_whisper.py (REQUIRED)
-│   ├── repair.py, map_sed_words.py (REQUIRED)
-│   ├── utils.py, __init__.py (REQUIRED)
-│   │
-│   ├── improved_train.py 🗑️ DELETE
-│   ├── ctc_align.py ⚠️ OPTIONAL
-│   │
-│   └── checkpoints/
-│       └── enhanced_best.pth (created after training)
-│
-├── datasets/
-│   ├── clips/stuttering-clips/clips/ (30,036 processed audio files)
-│   ├── SEP-28k_labels.csv, fluencybank_labels.csv
-│   ├── features/train/ (extracted spectrograms for training - created by preprocess_data.py)
-│   ├── features/val/ (extracted spectrograms for validation - created by preprocess_data.py)
-│   └── annotated_time_aligned/
-│
-└── output/
-    ├── repaired_audio/ ← FINAL AUDIO FILES ✅
-    ├── diagnostics/ (JSON reports)
-    ├── metrics/ (training metrics)
-    └── test_results/ (batch results)
+STEP 1: Extract multi-layer wav2vec2 temporal features (layers 7-12)
+    +-- python Models/extract_wav2vec2_temporal.py --layer-mode weighted-avg
+
+STEP 2: Stage 1 Training (seed 42, original labels)
+    +-- python Models/train_90plus_final.py --arch temporal_bilstm --seed 42 ...
+
+STEP 3: Self-Training Label Refinement
+    +-- python Models/self_train_refine.py --confidence-high 0.90 --confidence-low 0.10
+
+STEP 4: Stage 2 Training (seed 42, refined labels)
+    +-- python Models/train_90plus_final.py --data-dir refined/ --seed 42 ...
+
+STEP 5: Ensemble Training (seeds 123, 777 on refined labels)
+    +-- python Models/train_90plus_final.py --seed 123 ...
+    +-- python Models/train_90plus_final.py --seed 777 ...
+
+STEP 6: Ensemble + TTA Evaluation
+    +-- python Models/ensemble_eval.py --tta-shifts 5 --checkpoints [3 best checkpoints]
+```
+
+**Pipeline Hyperparameters:**
+
+| Parameter | Value |
+|-----------|-------|
+| Architecture | `temporal_bilstm` |
+| Epochs | 100 |
+| Batch size | 128 |
+| Learning rate | 3e-4 |
+| Weight decay | 5e-4 |
+| Scheduler | cosine (3-epoch warmup) |
+| Focal gamma | 2.0 |
+| MixUp alpha | 0.2 |
+| Label smoothing | 0.05 |
+| SWA start | epoch 60 |
+| SWA LR | 1e-5 |
+| Early stopping | 25 epochs |
+| Gradient clipping | 1.0 |
+| Oversampling | rare |
+| DataLoader workers | 4 |
+| PyTorch threads | 8 |
+
+**CPU Optimization (set in pipeline):**
+```powershell
+$env:OMP_NUM_THREADS = "8"
+$env:MKL_NUM_THREADS = "8"
+$env:NUMEXPR_MAX_THREADS = "8"
+$env:OPENBLAS_NUM_THREADS = "8"
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High Performance
+```
+
+**Usage:**
+```powershell
+cd D:\Bunny\AGNI
+conda activate agni311
+.\scripts\run_90plus_pipeline.ps1
+```
+
+### Other Pipeline Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/run_temporal_pipeline.ps1` | Extract temporal features -> train TemporalStutterClassifier -> calibrate -> evaluate |
+| `scripts/run_wav2vec2_pipeline.ps1` | Extract wav2vec2 embeddings -> train MLP -> calibrate -> evaluate |
+| `scripts/run_experiments.ps1` | Single training run with specific hyperparameters |
+| `scripts/experiment_suite.ps1` | Generates suite of HP experiments |
+
+### Data Utility Scripts
+
+| Script | Description |
+|--------|-------------|
+| `scripts/fix_label_audio_match.py` | Audits label-to-audio file mapping, creates symlinks for mismatches |
+| `scripts/make_speaker_split.py` | Creates speaker-holdout train/val/test splits |
+| `scripts/inspect_problem_files.py` | Generates waveform + spectrogram PNGs for problem audio |
+| `scripts/debug_extraction_trace.py` | Debugs feature extraction for specific files |
+| `scripts/estimate_batch_size.py` | Estimates safe batch size from available memory |
+| `scripts/probe_max_batch.py` | Binary-searches max batch size using synthetic model |
+| `scripts/probe_real_model.py` | Binary-searches max batch size using real CNNBiLSTM |
+
+---
+
+## 13. Tools & Utilities
+
+All in `tools/`:
+
+### Analysis & Ranking
+
+| Tool | Description |
+|------|-------------|
+| `analyze_runs.py` | Scans all training runs, ranks top 10 by val F1 macro |
+| `check_best.py` | Prints best epoch F1/P/R/AUC for a specific run |
+| `check_metrics.py` | Prints best/last F1 for the 8 most recent runs |
+| `check_thresholds.py` | Inspects threshold records from a training run |
+| `find_best_run.py` | Finds best run by chosen metric, locates checkpoint |
+
+### Hyperparameter Search
+
+| Tool | Description |
+|------|-------------|
+| `hp_sweep_random.py` | Random hyperparameter search: spawns training subprocesses with sampled LR, WD, batch, etc. |
+| `hp_sweep_analyze.py` | Analyzes HP sweep results, prints top N trials |
+| `collect_hp_sweep_results.py` | Collects all HP sweep results into `hp_sweep_results.json` |
+
+### Data Quality
+
+| Tool | Description |
+|------|-------------|
+| `inspect_dataset.py` | Inspects NPZ files: label distributions, shapes, NaN/Inf counts |
+| `compute_class_weights.py` | Computes per-class label counts and BCE pos_weight |
+| `standardize_labels.py` | Standardizes multi-level labels (2, 3) -> binary (0/1) |
+
+### Error Analysis & Label Correction
+
+| Tool | Description |
+|------|-------------|
+| `export_top_errors.py` | Exports top FP/FN errors to folders + CSV for human review |
+| `generate_corrections_template.py` | Creates label correction template from error analysis |
+| `apply_label_corrections.py` | Applies manual label corrections from CSV to NPZ files |
+| `make_apply_csv_from_template.py` | Converts correction template to applicable format |
+
+### Ensemble
+
+| Tool | Description |
+|------|-------------|
+| `ensemble_checkpoints.py` | Ensembles multiple checkpoints by averaging probabilities |
+
+---
+
+## 14. Tests
+
+All in `tests/`:
+
+### Unit Tests (5)
+
+| Test | Description |
+|------|-------------|
+| `test_augmentation.py` | Tests AudioAugmentation with zero-filled spectrogram |
+| `test_calibrate_thresholds_synth.py` | Tests threshold calibration with synthetic random data |
+| `test_cnn_bilstm.py` | Forward-pass test for CNNBiLSTM (123 channels -> 5 outputs) |
+| `test_preprocessor.py` | Tests EnhancedAudioPreprocessor with dummy audio, rejects short audio |
+| `test_preprocessor_array.py` | Tests preprocessor with various audio lengths |
+
+**Run tests:**
+```powershell
+cd D:\Bunny\AGNI
+conda activate agni311
+python -m pytest tests/ -v
+```
+
+### Diagnostic Scripts (20, prefixed `tmp_`)
+
+| Script | Description |
+|--------|-------------|
+| `tmp_apply_labels.py` | Re-applies label mappings to existing NPZ files |
+| `tmp_check_preproc.py` | Quick inspection of preprocessor defaults |
+| `tmp_check_silence.py` | Scans NPZ files for high-silence samples |
+| `tmp_count_corrupted_files.py` | Lists corrupted audio files |
+| `tmp_count_labels.py` | Counts per-class positive labels |
+| `tmp_diagnose_extract_import.py` | Tests extract_features_90plus import |
+| `tmp_import_test.py` | Verifies EnhancedAudioPreprocessor import |
+| `tmp_import_train_test.py` | Verifies train_90plus_final parses/imports |
+| `tmp_inspect_npz.py` | Reads one NPZ file and prints keys/shapes |
+| `tmp_label_stats.py` | Per-class positive counts and fractions |
+| `tmp_make_small_features.py` | Copies 200+50 NPZ files for fast iteration |
+| `tmp_model_check.py` | Instantiates CNNBiLSTM, prints param count, dummy forward |
+| `tmp_monitor.ps1` | Monitors CPU%, RAM, top Python processes |
+| `tmp_quick_eval.py` | Quick eval of a checkpoint with threshold loading |
+| `tmp_reprocess_problematic.py` | Re-extracts features from problematic samples |
+| `tmp_smoke_input_test.py` | End-to-end smoke: dataset -> DataLoader -> model forward |
+| `tmp_smoke_training_no_torch.py` | NumPy-only BCE loss sanity check |
+| `tmp_test_checkpoint.py` | Inspects extraction checkpoint JSON |
+| `tmp_trainer_smoke.py` | 3-epoch smoke training with 200+50 samples |
+| `tmp_verify_extraction.py` | Full extraction verification: NaN/Inf/shape checks |
+
+---
+
+## 15. Constants & Configuration
+
+**File:** `Models/constants.py`
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `TOTAL_CHANNELS` | 123 | 80 mel + 13 MFCC + 13 delta + 13 delta-delta + 4 spectral |
+| `NUM_CLASSES` | 5 | Prolongation, Block, SoundRep, WordRep, Interjection |
+| `DEFAULT_SAMPLE_RATE` | 16000 | Audio sample rate |
+| `AUG_TIME_MASK_P` | 0.6 | Default time masking probability |
+| `AUG_FREQ_MASK_P` | 0.5 | Default frequency masking probability |
+| `AUG_NOISE_P` | 0.4 | Default Gaussian noise probability |
+| `AUG_STRETCH_P` | 0.25 | Default time stretch probability |
+| `AUG_PITCH_P` | 0.25 | Default pitch shift probability |
+| `AUG_SNR_P` | 0.25 | Default SNR noise probability |
+| `THRESH_SEARCH_START` | 0.25 | Threshold search range start |
+| `THRESH_SEARCH_END` | 0.85 | Threshold search range end |
+| `THRESH_SEARCH_STEP` | 0.025 | Threshold search step size |
+| `SCHEDULER_PATIENCE` | 7 | ReduceLROnPlateau patience |
+| `THRESHOLD_OPT_EPOCHS` | 5 | Epochs between threshold optimization |
+
+---
+
+## 16. Directory Structure
+
+```
+D:\Bunny\AGNI\
+|-- README.md                           # This file
+|-- requirements_complete.txt           # Pinned dependencies
+|
+|-- datasets/
+|   |-- SEP-28k_labels.csv             # SEP-28k 3-annotator labels
+|   |-- SEP-28k_episodes.csv           # Episode metadata
+|   |-- fluencybank_labels.csv         # FluencyBank labels
+|   |-- fluencybank_episodes.csv       # Episode metadata
+|   |-- label_audio_map.json           # Label stem -> audio path mapping
+|   |-- clips/
+|   |   +-- stuttering-clips/clips/    # Raw WAV audio files (16kHz)
+|   |-- features/                      # 123-channel spectrogram NPZs
+|   |   |-- train/*.npz                # ~25,445 files
+|   |   |-- val/*.npz                  # ~6,470 files
+|   |   +-- _label_cache.pkl           # Label cache for fast loading
+|   |-- features_w2v_temporal/         # wav2vec2 temporal NPZs (768, T)
+|   |   |-- train/*.npz
+|   |   +-- val/*.npz
+|   |-- features_w2v_temporal_refined/ # Self-training refined labels
+|   |   |-- train/*.npz
+|   |   +-- val/*.npz
+|   |-- corrupted_audio/               # Staged corrupted files
+|   +-- problematic_samples/           # Flagged problem files
+|
+|-- Models/
+|   |-- __init__.py
+|   |-- constants.py                   # Project constants
+|   |-- utils.py                       # FocalLoss, multilabel_f1, diagnostics
+|   |
+|   |-- # --- Feature Extraction ---
+|   |-- enhanced_audio_preprocessor.py # 123-channel feature extractor
+|   |-- extract_features_90plus.py     # Batch spectrogram extraction pipeline
+|   |-- extract_features.py            # Re-exports extract_features_90plus
+|   |-- extract_wav2vec2_temporal.py   # wav2vec2 temporal feature extraction
+|   |
+|   |-- # --- Model Architectures ---
+|   |-- model_temporal_bilstm.py       # TemporalBiLSTMClassifier (2.07M, primary)
+|   |-- model_temporal_w2v.py          # TemporalStutterClassifier (870K)
+|   |-- model_cnn_bilstm.py            # CNNBiLSTM (baseline)
+|   |-- model_improved_90plus.py       # ImprovedStutteringCNN
+|   |-- model_improved_90plus_large.py # ImprovedStutteringCNNLarge
+|   |-- model_improved_90plus_se.py    # ImprovedStutteringCNNLargeSE
+|   |
+|   |-- # --- Training & Evaluation ---
+|   |-- train_90plus_final.py          # Training system (~2039 lines)
+|   |-- calibrate_thresholds.py        # Temperature scaling + threshold search
+|   |-- eval_validation.py             # Validation evaluation + plots
+|   |-- self_train_refine.py           # Self-training label refinement
+|   |-- ensemble_eval.py               # Ensemble + TTA evaluation
+|   |
+|   |-- # --- Diagnostics ---
+|   |-- diagnose_best_checkpoint.py    # Per-sample FP/FN analysis
+|   |-- diagnostic_checks.py           # Pipeline integrity checks
+|   |-- inspect_probs.py               # Raw probability inspection
+|   |-- inspect_val_stats.py           # Validation set statistics
+|   |-- produce_evaluation_plots.py    # ROC, PR, confusion matrix plots
+|   |
+|   |-- # --- Repair ---
+|   |-- repair_advanced.py             # Vocoder-based stutter repair (725 lines)
+|   |-- augment_repetitions.py         # Synthetic word repetition augmentation
+|   |-- COMPLETE_PIPELINE.py           # End-to-end orchestration
+|   |
+|   |-- checkpoints/                   # Saved model checkpoints
+|   |   +-- training_YYYYMMDD_HHMMSS/  # Per-run checkpoint directories
+|   |       |-- <arch>_best.pth
+|   |       +-- <arch>_epoch_<N>.pth
+|   +-- annotator/
+|       +-- annotator.html             # Browser-based Whisper alignment annotator
+|
+|-- scripts/
+|   |-- run_90plus_pipeline.ps1        # Main 6-step training pipeline
+|   |-- run_temporal_pipeline.ps1      # Temporal CNN pipeline
+|   |-- run_wav2vec2_pipeline.ps1      # wav2vec2 embedding pipeline
+|   |-- run_experiments.ps1            # Single training run
+|   |-- experiment_suite.ps1           # HP experiment generator
+|   |-- fix_label_audio_match.py       # Label-to-audio mapping audit
+|   |-- make_speaker_split.py          # Speaker-holdout splits
+|   |-- inspect_problem_files.py       # Problem file visualization
+|   |-- debug_extraction_trace.py      # Extraction debugging
+|   |-- estimate_batch_size.py         # Batch size estimator
+|   |-- probe_max_batch.py             # Max batch finder (synthetic)
+|   +-- probe_real_model.py            # Max batch finder (real model)
+|
+|-- tools/
+|   |-- analyze_runs.py                # Rank runs by F1
+|   |-- check_best.py                  # Best epoch details
+|   |-- check_metrics.py               # Recent runs summary
+|   |-- check_thresholds.py            # Threshold inspection
+|   |-- find_best_run.py               # Find best run + checkpoint
+|   |-- hp_sweep_random.py             # Random HP search
+|   |-- hp_sweep_analyze.py            # Analyze HP sweep results
+|   |-- collect_hp_sweep_results.py    # Collect HP sweep data
+|   |-- inspect_dataset.py             # Dataset quality inspection
+|   |-- compute_class_weights.py       # Class weight computation
+|   |-- standardize_labels.py          # Label standardization
+|   |-- export_top_errors.py           # Error analysis export
+|   |-- generate_corrections_template.py # Correction template
+|   |-- apply_label_corrections.py     # Apply label corrections
+|   |-- make_apply_csv_from_template.py # Correction CSV conversion
+|   +-- ensemble_checkpoints.py        # Quick checkpoint ensemble
+|
+|-- tests/                             # Unit tests + diagnostic scripts
+|   |-- test_augmentation.py
+|   |-- test_calibrate_thresholds_synth.py
+|   |-- test_cnn_bilstm.py
+|   |-- test_preprocessor.py
+|   |-- test_preprocessor_array.py
+|   +-- tmp_*.py                       # 20 diagnostic/temporary scripts
+|
+|-- Online_test/
+|   +-- I Have a Stutter 60 Second Docs.mp3  # Sample test audio
+|
+|-- output/
+|   |-- thresholds.json                # Current best thresholds
+|   |-- ensemble_eval/                 # Ensemble evaluation results
+|   |-- training_YYYYMMDD_HHMMSS/      # Per-run metrics & logs
+|   +-- eval_*/                        # Evaluation outputs
+|
++-- ffmpeg/                            # FFmpeg binary (for audio conversion)
 ```
 
 ---
 
-## ⏱️ TIME BREAKDOWN
+## 17. Training History & Results
 
-**For your Lenovo ThinkPad T14 Gen 2i (i7-1165G7, 4 cores, 40GB RAM):**
+### Best Results by Architecture
 
-| Operation | Batch 32 | Batch 64 | Batch 96 | Batch 128 |
-|-----------|----------|----------|----------|-----------|
-| Activate env | <1s | <1s | <1s | <1s |
-| **Preprocess data** | **~2 min** | **~2 min** | **~2 min** | **~2 min** |
-| Train 30 epochs | 2-3 hrs | **1-2 hrs** ⭐ | 1-1.5 hrs | 45 min - 1 hr |
-| Test 1 file | <10s | <10s | <10s | <10s |
-| Repair 1 file | 5-10s | 5-10s | 5-10s | 5-10s |
-| Batch 100 files | 8-15m | 8-15m | 8-15m | 8-15m |
+| Architecture | Best Val F1 | Epochs | Config | Notes |
+|-------------|------------|--------|--------|-------|
+| CNNBiLSTM | 0.604 | 16 (early stop) | batch=96, lr=auto, oversample=rare, EMA | Baseline on 123-ch spectrograms |
+| ImprovedStutteringCNN | 0.539 | 60 | batch=64, lr=1e-4 | AUC ~0.75, per-class AUCs: [0.77, 0.67, 0.77, 0.72, 0.83] |
+| MLP on wav2vec2 embeddings | 0.554 | - | Mean+std pooling destroys temporal info | Not competitive |
+| TemporalBiLSTM | TBD | - | Currently running pipeline | Expected: 0.75-0.85 |
 
-**Note:** Preprocessing (2 min) is ONE-TIME ONLY. After first preprocessing, training can be repeated without re-preprocessing.
+### Best CNN-BiLSTM Run Details
+
+```
+Checkpoint: Models/checkpoints/training_20260219_015326/cnn_bilstm_best.pth
+Command: python Models/train_90plus_final.py --epochs 100 --batch-size 96
+         --arch cnn_bilstm --oversample rare --auto-calibrate --verbose
+         --num-workers 2 --omp-threads 4 --accumulate 4 --use-ema
+         --sched-patience 5 --early-stop 15
+
+Per-class AUCs: [0.6174, 0.6124, 0.6261, 0.6144, 0.6428]
+Per-class APs:  [0.3979, 0.5078, 0.3056, 0.2418, 0.4819]
+```
+
+### ImprovedStutteringCNN Run Details
+
+```
+60 epochs, best val F1 = 0.5391
+Precision: 0.4217, Recall: 0.7706
+Per-class AUCs: [0.77, 0.67, 0.77, 0.72, 0.83]
+```
+
+### Current Pipeline (Expected)
+
+Training the TemporalBiLSTMClassifier with:
+- Multi-layer wav2vec2 temporal features (layers 7-12 weighted average)
+- Self-training label refinement
+- 3-model ensemble (seeds 42, 123, 777)
+- Test-time augmentation (5 shifts)
+- Per-class threshold optimization
+
+**Expected metrics:**
+
+| Metric | Expected Range |
+|--------|---------------|
+| Macro F1 | 0.75 - 0.85 |
+| Mean class accuracy | 0.85 - 0.92 |
+| AUC-ROC | 0.88 - 0.95 |
 
 ---
 
-## ✅ EXPECTED RESULTS
+## 18. Troubleshooting
 
-### Training (30 epochs on i7-1165G7 with batch-size 64)
-- ✅ Time: 1-2 hours
-- ✅ Best Model Epoch: ~15-20
-- ✅ Final F1: 50-65%
-- ✅ Early Stop: ~22-28 epochs
-- ✅ RAM Used: ~19 GB (safe on 40GB system)
+### Common Issues
 
-### Inference
-- ✅ Accuracy: 50-85% F1
-- ✅ Speed: 1-5s per 10s clip (CPU)
-- ✅ Quality: No artifacts
-- ✅ Coverage: 60-80% of stuttering
+**torchaudio import error:**
+```
+ModuleNotFoundError: No module named 'torchaudio._internal.fb'
+```
+Solution: We don't use torchaudio. All audio loading uses `scipy.io.wavfile` + `scipy.signal.resample_poly`.
+
+**PowerShell encoding error (em-dash U+2014):**
+```
+The string is missing the terminator: "
+```
+Solution: Ensure all `.ps1` files use ASCII-only characters. No em-dashes, smart quotes, or non-ASCII.
+
+**Slow label loading (31k+ NPZ reads):**
+Solution: Fixed with pickle cache at `datasets/features/_label_cache.pkl`. Delete cache to force rebuild.
+
+**Out of memory during training:**
+Solution: Reduce `--batch-size` (try 64 or 32). Check with `scripts/estimate_batch_size.py`.
+
+**fbgemm.dll error on Windows:**
+Solution: Use CPU-only PyTorch: `pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu`
+
+**Extraction resuming / skipping files:**
+Solution: The extraction script skips existing `.npz` files. Delete `datasets/features_w2v_temporal/` to force full re-extraction.
+
+### Performance Tips
+
+1. **Power Plan:** Set to High Performance: `powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c`
+2. **Thread count:** Set `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to your logical CPU count
+3. **Batch size:** With 40 GB RAM, batch 128 is safe for temporal features
+4. **DataLoader workers:** 4 workers for 4-core CPU
+5. **Page file:** Set to at least 8 GB for 40 GB RAM systems
 
 ---
 
-## 🛠️ TROUBLESHOOTING
+## License
 
-### Training is slow
-```powershell
-# Increase batch size (your laptop has 40GB RAM - use it!)
---batch-size 32  # 2× faster
---batch-size 64  # 3× faster (if you want maximum speed)
-
-# Or use SimpleCNN (smaller model)
---model simple
-
-# Or reduce epochs for testing
---epochs 5
-```
-
-### High RAM usage
-```powershell
-# Reduce batch size
---batch-size 16
---batch-size 8
-```
-
-### CUDA out of memory (if using GPU)
-```powershell
-# Reduce batch size
---batch-size 8
-
-# Or use CPU instead
-(don't add --gpu flag)
-```
-
-### Model not found
-```powershell
-# Run training first
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 32
-```
-
-### Low accuracy (F1 < 40%)
-- Increase training epochs (try 50+)
-- Increase batch size (try 32 or 64)
-- Check data quality in datasets/
-- Adjust detection threshold
-
-### Audio sounds unnatural
-```powershell
-# Try attenuate mode (recommended)
---mode attenuate
-
-# Or try silence
---mode silence
-```
-
-### Preprocessing data
-```powershell
-# If you need to re-extract features from raw audio
-python Models/preprocess_data.py
-# Outputs: datasets/features/train/ and datasets/features/val/
-```
+Internal research project.
 
 ---
 
-## � YOUR LAPTOP SPECS & RECOMMENDATIONS
-
-**Current System (Lenovo ThinkPad T14 Gen 2i):**
-- CPU: Intel Core i7-1165G7 (4 cores, 8 threads @ 2.80 GHz turbo to 4.70 GHz)
-- RAM: 40 GB total (~21 GB available during training)
-- GPU: Intel Iris Xe Graphics (2 GB VRAM - not recommended for training)
-- Storage: Sufficient for datasets/features + model checkpoints
-
-**Performance Recommendations:**
-
-✅ **Training (Optimal):**
-- Use CPU only (Iris Xe not efficient for PyTorch training)
-- Batch size: **64** (recommended for 1-2 hour training) ⭐
-- Alternative: batch 96 for 1-1.5 hours (faster but higher RAM)
-- Training time: 1-2 hours for 30 epochs (batch-64)
-- RAM usage: ~19 GB (safe headroom on 40GB)
-
-✅ **Inference (Prediction & Repair):**
-- Much faster (10-20 seconds per file total)
-- CPU runs fine, no GPU acceleration needed
-- Can process large batches sequentially
-
-⚠️ **GPU Not Recommended:**
-- Intel Iris Xe is integrated GPU (not discrete)
-- PyTorch support on Iris Xe is poor
-- CPU training actually faster on 4-core i7
-- Skip GPU setup - stick with CPU-only
-
-**Memory Management (Choose Based on Needs):**
-- Batch 16: ~8 GB RAM usage (slowest)
-- Batch 32: ~10 GB RAM usage (2-3 hours)
-- Batch 64: ~19 GB RAM usage ← **BEST BALANCE** ⭐
-- Batch 96: ~28 GB RAM usage (faster but less headroom)
-- Batch 128: ~36 GB RAM usage (fastest but risky)
-
----
-
-## 📚 DATASET INFO
-
-- **Total Clips:** 32,321 audio files (30,036 processed)
-- **SEP-28k:** 28,177 labeled clips
-- **FluencyBank:** 4,144 labeled clips
-- **Classes:** 5 stutter types (Prolongation, Block, Sound Rep, Word Rep, Interjection)
-- **Format:** Multi-label (clips can have multiple types)
-- **Audio:** 16 kHz baseline, diverse speakers/accents
-- **Location:** `datasets/clips/stuttering-clips/clips/`
-
----
-
-## 🎯 COMMAND REFERENCE (Copy & Paste - All Tested & Working ✅)
-
-### Preprocessing & Setup
-```powershell
-# 1. Activate environment (always first!)
-cd d:\Bunny\AGNI
-.venv_models\Scripts\Activate.ps1
-
-# 2. Preprocess data (one-time, ~2 minutes) ← DO THIS FIRST!
-python Models/preprocess_data.py
-# Extracts: datasets/features/train/ and datasets/features/val/
-# Only run ONCE unless you add new audio files
-```
-
-### Training
-```powershell
-# Train model (RECOMMENDED: batch 96 for fastest, batch 64 for balance)
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 96
-
-# Alternative: batch 64 (good balance - 1-2 hours)
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 64
-
-# Alternative: batch 32 (slowest but most stable - 2-3 hours)
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 32
-```
-
-### Detection & Testing (Tested ✅)
-```powershell
-# Test detection on single file (default threshold 0.3)
-python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json
-
-# Test detection with custom threshold
-python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json --threshold 0.3
-
-# Test detection on multiple files
-python Models/predict_enhanced.py --model enhanced --batch-dir datasets/clips/stuttering-clips/clips/ --output-dir output/batch_results/
-```
-
-### Audio Repair - Full Pipeline (Tested ✅)
-```powershell
-# RECOMMENDED: Attenuate mode (most natural - reduces volume by -10dB)
-python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/FluencyBank_010_0_repaired.wav --mode attenuate --threshold 0.3
-
-# Alternative: Silence mode (replace with silence)
-python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/FluencyBank_010_0_repaired.wav --mode silence --threshold 0.3
-
-# Alternative: Remove mode (excise stuttered words - aggressive)
-python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/FluencyBank_010_0_repaired.wav --mode remove --threshold 0.3
-```
-
-### Complete End-to-End Workflow (Feb 13 Tested)
-```powershell
-# 1. Activate environment
-.venv_models\Scripts\Activate.ps1
-
-# 2. PREPROCESS DATA (one-time, ~2 minutes) ← REQUIRED FIRST!
-python Models/preprocess_data.py
-
-# 3. Train model (batch 96 - ~1-1.5 hours)
-python Models/improved_train_enhanced.py --model enhanced --epochs 30 --batch-size 96
-
-# 4. Test detection (Epoch 1 achieves: Train F1=0.2697, Val F1=0.2527)
-python Models/predict_enhanced.py --model enhanced --input datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output test_result.json --threshold 0.3
-
-# 5. Repair audio (creates: .wav + .json report)
-python Models/run_asr_map_repair.py --model_path Models/checkpoints/enhanced_best.pth --input_file datasets/clips/stuttering-clips/clips/FluencyBank_010_0.wav --output_file output/repaired_audio/FluencyBank_010_0_repaired.wav --mode attenuate --threshold 0.3
-
-# 6. Listen to result!
-# Open: output/repaired_audio/FluencyBank_010_0_repaired.wav 🎵
-```
-
----
-
-## 🧪 LATEST TEST RESULTS (February 13, 2026)
-
-### Online Test File: "I Have a Stutter 60 Second Docs.mp3"
-```
-File: D:\Bunny\AGNI\Online_test\I Have a Stutter  60 Second Docs.mp3
-Duration: 68.24 seconds
-Content: Real stutter documentary (high-quality speech material)
-```
-
-**Detection Results (Threshold 0.3):**
-```
-✓ Stuttering detected: 100% (52/52 frames)
-
-Per-class counts:
-  Prolongation:      52 instances
-  Block:             48 instances  
-  Sound Repetition:  52 instances
-  Word Repetition:   4 instances
-  Interjection:      52 instances
-  
-Model Confidence: Multiple classes triggered above threshold
-Transcription: "My name is Ray Demnitz. I'm 20 years old..." (149 words)
-```
-
-**Repair Results (Threshold 0.5, Attenuate Mode):**
-- ✅ Repaired audio created: `I_Have_a_Stutter_v2.wav`
-- ✅ JSON report created: `I_Have_a_Stutter_v2.asr_repair.json`
-- ⚠️ Current model (Epoch 1) too weak - only 13/137 windows qualified for repair
-- ℹ️ Better results expected after training completes (Epoch 15-25)
-
-**Analysis:** Model correctly detects stuttering patterns, but confidence scores low (~0.35-0.40). Expected to improve 2-3x with full training to epochs 15-25.
-
----
-
-## ✨ CURRENT STATUS (February 13, 2026 - POST HYPERPARAMETER FIX)
-
-### ⚠️ TRAINING IN PROGRESS
-
-**Stage:** Retraining with improved hyperparameters
-- **Start:** Feb 13, 2026 ~10:00 AM
-- **Duration:** ~17 hours (30 epochs × 35 min each)
-- **Expected Completion:** Feb 13, ~3-4 AM next morning
-- **Best model:** Will be automatically saved at peak epoch (expect epoch 15-25)
-
-**Current Checkpoint:**
-- Previous: enhanced_best.pth (Epoch 1, F1=0.2527) ✗ OUTDATED
-- New: Training fresh with fixes
-- Target: enhanced_best.pth (Epoch 15-25, F1≥0.50) ✅ UPCOMING
-
-### ✅ SYSTEMS FULLY WORKING
-
-**All 3 Workflows Functional:**
-1. ✅ **Training:** `improved_train_enhanced.py` - Running with new hyperparameters
-2. ✅ **Detection:** `predict_enhanced.py` - Tested on online file (100% stuttering found)
-3. ✅ **Repair:** `run_asr_map_repair.py` - Creates repaired audio + JSON report
-
-**Production Features:**
-- ✅ Whisper ASR integration (converts speech to text)
-- ✅ Word-level stuttering mapping
-- ✅ 3 repair modes (attenuate/silence/remove)
-- ✅ Comprehensive JSON diagnostics
-- ✅ Per-class confidence scores
-- ✅ Real-time progress bars
-- ✅ Automatic checkpointing
-
-### 📊 Performance Expectations (After Training Completes)
-
-| Metric | Current (Epoch 1) | Expected (Epoch 15-25) |
-|--------|-------------------|------------------------|
-| Val F1 | 0.2527 | **0.50-0.70** |
-| Detection Rate | 80.15% | **85-90%** |
-| Precision | 16.86% | **50-70%** |
-| Per-class F1 | 0.02-0.46 | **0.35-0.75** |
-
----
-
-## ✨ FINAL STATUS (February 13, 2026 - LEGACY SECTION)
-
-**Training Session Results:**
-- ✅ Model trained with fixes (LR=1e-4, threshold=0.3)
-- ✅ Epoch 1: Train F1=0.2697, Val F1=0.2527 (vs 0.0000 before fixes)
-- ✅ Model checkpoint saved: 16MB
-- ✅ Detection working with 100% recall on test audio
-- ✅ Repair pipeline creates clean audio output
-
-**All 3 Workflows Tested:**
-1. ✅ **Training:** `improved_train_enhanced.py` - Working perfectly
-2. ✅ **Detection:** `predict_enhanced.py` - Detects stuttering correctly
-3. ✅ **Repair:** `run_asr_map_repair.py` - Creates repaired audio + report
-
-**Performance on Test Audio (FluencyBank_010_0.wav):**
-- Detection: 100% stuttering identified
-- Classes detected: Prolongation, Block, Sound Rep, Interjection
-- Repair: Audio saved with attenuated stuttering
-- Report: Full diagnostics in JSON format
-
-**Your System:**
+*Last updated: March 2, 2026*
