@@ -1,6 +1,6 @@
 # AGNI - Stuttering Detection & Repair System
 
-> End-to-end multi-label stuttering detection using wav2vec2 temporal features, BiLSTM+CNN classifiers, self-training label refinement, ensemble learning, and test-time augmentation. Includes vocoder-based stutter repair.
+> Hierarchical stuttering detection using end-to-end wav2vec2-large fine-tuning. Binary detection (stutter vs fluent, 90+ F1 target) as PRIMARY task, 5-class type classification as SECONDARY. Includes frozen-feature BiLSTM+CNN classifiers, self-training label refinement, ensemble learning, test-time augmentation, production inference pipeline, and vocoder-based stutter repair.
 
 ---
 
@@ -14,29 +14,32 @@
    - 5.1 [123-Channel Spectrogram Features](#51-123-channel-spectrogram-features)
    - 5.2 [Temporal wav2vec2 Features (Primary)](#52-temporal-wav2vec2-features-primary)
 6. [Model Architectures](#6-model-architectures)
-   - 6.1 [TemporalBiLSTMClassifier (Primary - 2.07M params)](#61-temporalbilstmclassifier-primary---207m-params)
-   - 6.2 [TemporalStutterClassifier (870K params)](#62-temporalstutterclassifier-870k-params)
-   - 6.3 [CNNBiLSTM (Baseline)](#63-cnnbilstm-baseline)
-   - 6.4 [ImprovedStutteringCNN](#64-improvedstutteringcnn)
-   - 6.5 [ImprovedStutteringCNNLarge](#65-improvedstutteringcnnlarge)
-   - 6.6 [ImprovedStutteringCNNLargeSE](#66-improvedstutteringcnnlargese)
+   - 6.1 [Wav2VecFineTuneClassifier (Production - 317.6M params)](#61-wav2vecfinetuneclassifier-production---3176m-params)
+   - 6.2 [TemporalBiLSTMClassifier (Frozen Features - 2.07M params)](#62-temporalbilstmclassifier-frozen-features---207m-params)
+   - 6.3 [TemporalStutterClassifier (870K params)](#63-temporalstutterclassifier-870k-params)
+   - 6.4 [CNNBiLSTM (Baseline)](#64-cnnbilstm-baseline)
+   - 6.5 [ImprovedStutteringCNN](#65-improvedstutteringcnn)
+   - 6.6 [ImprovedStutteringCNNLarge](#66-improvedstutteringcnnlarge)
+   - 6.7 [ImprovedStutteringCNNLargeSE](#67-improvedstutteringcnnlargese)
 7. [Training System](#7-training-system)
-   - 7.1 [Data Loading & Augmentation](#71-data-loading--augmentation)
-   - 7.2 [Loss Functions](#72-loss-functions)
-   - 7.3 [Optimizers & Schedulers](#73-optimizers--schedulers)
-   - 7.4 [Training Techniques](#74-training-techniques)
-   - 7.5 [All CLI Arguments](#75-all-cli-arguments)
-8. [Calibration & Evaluation](#8-calibration--evaluation)
-9. [Self-Training Label Refinement](#9-self-training-label-refinement)
-10. [Ensemble Evaluation with TTA](#10-ensemble-evaluation-with-tta)
-11. [Stutter Repair](#11-stutter-repair)
-12. [Pipeline Scripts](#12-pipeline-scripts)
-13. [Tools & Utilities](#13-tools--utilities)
-14. [Tests](#14-tests)
-15. [Constants & Configuration](#15-constants--configuration)
-16. [Directory Structure](#16-directory-structure)
-17. [Training History & Results](#17-training-history--results)
-18. [Troubleshooting](#18-troubleshooting)
+   - 7.1 [End-to-End Fine-Tuning (Production)](#71-end-to-end-fine-tuning-production)
+   - 7.2 [Frozen-Feature Training](#72-frozen-feature-training)
+   - 7.3 [Data Loading & Augmentation](#73-data-loading--augmentation)
+   - 7.4 [Loss Functions](#74-loss-functions)
+   - 7.5 [Optimizers & Schedulers](#75-optimizers--schedulers)
+   - 7.6 [Training Techniques](#76-training-techniques)
+8. [Production Inference](#8-production-inference)
+9. [Calibration & Evaluation](#9-calibration--evaluation)
+10. [Self-Training Label Refinement](#10-self-training-label-refinement)
+11. [Ensemble Evaluation with TTA](#11-ensemble-evaluation-with-tta)
+12. [Stutter Repair](#12-stutter-repair)
+13. [Pipeline Scripts](#13-pipeline-scripts)
+14. [Tools & Utilities](#14-tools--utilities)
+15. [Tests](#15-tests)
+16. [Constants & Configuration](#16-constants--configuration)
+17. [Directory Structure](#17-directory-structure)
+18. [Training History & Results](#18-training-history--results)
+19. [Troubleshooting](#19-troubleshooting)
 
 ---
 
@@ -57,21 +60,28 @@ AGNI is an end-to-end system for:
 | 3 | WordRep | Word repetition ("I I I want") |
 | 4 | Interjection | Filler words ("um", "uh", "like") |
 
-**Approach:** Extract temporal frame-level features from wav2vec2-base (frozen), train a BiLSTM+CNN+Attention classifier, refine noisy labels via self-training, train an ensemble of 3 models with different seeds, apply test-time augmentation, and optimize per-class decision thresholds.
+**Approach:** Hierarchical detection system:
+- **PRIMARY (90+ target):** Binary stutter detection (stutter vs fluent) using end-to-end wav2vec2-large fine-tuning
+- **SECONDARY:** 5-class type classification (Prolongation/Block/SoundRep/WordRep/Interjection)
+- **Frozen-feature path:** Extract temporal features from wav2vec2-base (frozen), train BiLSTM+CNN+Attention classifier
+- **Label quality:** Majority vote (>=2 annotators), noise removal (Unsure/PoorAudio/NoSpeech/Music)
 
 ### Key Files
 
 | File | Purpose |
 |------|---------|
-| `Models/extract_wav2vec2_temporal.py` | Temporal wav2vec2 feature extraction (multi-layer weighted average) |
-| `Models/model_temporal_bilstm.py` | Primary model: BiLSTM + Dilated CNN + Multi-Head Attention |
-| `Models/train_90plus_final.py` | Training loop, dataset, augmentation, all techniques (~2039 lines) |
+| `Models/model_w2v_finetune.py` | **Production model:** End-to-end wav2vec2-large with binary + 5-class heads (317.6M params) |
+| `Models/train_w2v_finetune.py` | **Production training:** Hierarchical loss, binary F1 model selection, threshold optimization |
+| `Models/detect.py` | **Production inference:** Single file / directory / sliding window detection |
+| `scripts/run_finetune_pipeline.ps1` | **Production pipeline:** Complete training launch script |
+| `Models/model_temporal_bilstm.py` | Frozen-feature model: BiLSTM + Dilated CNN + Multi-Head Attention |
+| `Models/train_90plus_final.py` | Frozen-feature training loop (~2039 lines) |
+| `Models/extract_wav2vec2_temporal.py` | Temporal wav2vec2-base feature extraction |
 | `Models/self_train_refine.py` | Self-training label refinement |
 | `Models/ensemble_eval.py` | Ensemble + TTA evaluation |
 | `Models/calibrate_thresholds.py` | Temperature scaling + per-class threshold optimization |
-| `Models/eval_validation.py` | Validation evaluation with AUC/AP curves |
 | `Models/repair_advanced.py` | Vocoder-based stutter repair (725 lines) |
-| `scripts/run_90plus_pipeline.ps1` | Complete 6-step training pipeline |
+| `scripts/run_90plus_pipeline.ps1` | Frozen-feature 6-step training pipeline |
 
 ---
 
@@ -119,11 +129,38 @@ See `requirements_complete.txt` for the full pinned dependency list.
 
 **Sources:** SEP-28k + FluencyBank corpora
 
+### Raw Dataset
+
 | Split | Files | Source |
 |-------|-------|--------|
 | Train | ~25,445 | 80% of labeled clips |
 | Val | ~6,470 | 20% of labeled clips |
 | **Total** | **~31,915** | |
+
+### Cleaned Dataset (Production)
+
+After label cleaning and majority vote filtering:
+
+| Cleaning Step | Removed | Remaining |
+|---------------|---------|-----------|
+| Raw total | — | ~31,915 |
+| Noise removal (Unsure/PoorAudio/NoSpeech/Music) | ~4,526 | ~27,389 |
+| Majority vote (≥2 of 3 annotators agree) | further | ~25,374 |
+| **Final Split** | | |
+| Train (cleaned) | | **20,193** |
+| Val (cleaned) | | **5,181** |
+
+**Binary Balance (cleaned train):** 52.3% stutter / 47.7% fluent
+
+**Per-Class Distribution (majority vote, train):**
+
+| Class | Count |
+|-------|-------|
+| Prolongation | 2,018 |
+| Block | 2,474 |
+| SoundRep | 1,772 |
+| WordRep | 2,186 |
+| Interjection | 4,634 |
 
 **Raw Audio:** `datasets/clips/stuttering-clips/clips/*.wav` (16 kHz, mono WAV)
 
@@ -134,7 +171,7 @@ See `requirements_complete.txt` for the full pinned dependency list.
 - `datasets/fluencybank_episodes.csv` - Episode metadata
 - `datasets/label_audio_map.json` - Mapping from label stems to audio file paths
 
-**Labels:** Multi-label binary - each sample can have multiple stutter types simultaneously. Original annotations from 3 annotators are binarized: `value > 0 -> 1.0`.
+**Labels:** Multi-label binary - each sample can have multiple stutter types simultaneously. Original annotations from 3 annotators are binarized via majority vote (≥2 agree → 1.0). Noise labels (Unsure, PoorAudio, NoSpeech, Music, DifficultToUnderstand) are used for sample exclusion, not as classification targets.
 
 **Feature Directories:**
 
@@ -143,6 +180,7 @@ See `requirements_complete.txt` for the full pinned dependency list.
 | `datasets/features/{train,val}/*.npz` | `spectrogram (123, T)` + `labels (5,)` | CNN models |
 | `datasets/features_w2v_temporal/{train,val}/*.npz` | `temporal_embedding (768, T)` + `labels (5,)` | BiLSTM/CNN temporal models |
 | `datasets/features_w2v_temporal_refined/{train,val}/*.npz` | Same format, cleaned labels | Stage 2 training |
+| N/A (raw audio directly) | WAV files loaded at runtime | Wav2VecFineTuneClassifier |
 
 ---
 
@@ -258,12 +296,68 @@ os.environ['MKL_NUM_THREADS'] = str(N_CORES)
 
 ## 6. Model Architectures
 
-### 6.1. TemporalBiLSTMClassifier (Primary - 2.07M params)
+### 6.1. Wav2VecFineTuneClassifier (Production - 317.6M params)
+
+**File:** `Models/model_w2v_finetune.py` (389 lines)
+**Training:** `Models/train_w2v_finetune.py` (~1049 lines)
+
+The production model. End-to-end fine-tuning of wav2vec2-large with hierarchical classification:
+- **BINARY head (PRIMARY):** Stutter vs fluent detection (90+ F1 target)
+- **5-class heads (SECONDARY):** Per-type stutter classification
+
+**Key design:**
+- wav2vec2-large backbone (24 transformer layers, 1024-dim)
+- Bottom 12 layers frozen, top 12 fine-tuned (161.7M trainable / 317.6M total = 50.9%)
+- Weighted layer combination across all 25 hidden states (learned weights)
+- BiLSTM + Dilated CNN + Wide Conv fusion
+- Multi-Head Attention Pooling with per-class specialization
+- Separate binary head + 5 per-class heads
+
+**Constructor:**
+```python
+Wav2VecFineTuneClassifier(
+    model_name='facebook/wav2vec2-large',
+    n_classes=5,
+    freeze_layers=12,         # Freeze bottom 12 transformer layers
+    lstm_hidden=128,          # Per-direction LSTM hidden size
+    lstm_layers=2,
+    use_gradient_checkpointing=True
+)
+```
+
+**Layer-by-Layer:**
+
+| Layer | Output Shape | Details |
+|-------|-------------|---------|
+| Raw audio input | `(B, T_samples)` | 16 kHz mono WAV |
+| wav2vec2-large encoder | `(B, T_frames, 1024)` × 25 layers | 24 transformer layers + CNN features |
+| Weighted layer combination | `(B, T_frames, 1024)` | Learned softmax weights over all 25 hidden states |
+| LayerNorm + Dropout(0.1) | `(B, T_frames, 1024)` | Normalize combined features |
+| BiLSTM (2 layers, 128/dir) | `(B, T_frames, 256)` | Sequential temporal modeling |
+| DilatedCNN (d=1,2,4) | `(B, T_frames, 128)` | Multi-scale local patterns |
+| WideConv (kernel=7) | `(B, T_frames, 64)` | Broad context capture |
+| Fusion: cat + project | `(B, T_frames, 256)` | Concatenate BiLSTM+CNN+WideConv → 256-dim |
+| Multi-Head Attention Pool (5 heads) | `(B, 5, 256)` | Per-class attention over temporal axis |
+| Per-class classifier × 5 | `(B, 5)` (logits) | `Linear(256→64→1)` per class |
+| Binary head | `(B, 1)` (logit) | `Linear(256→64→1)` from mean-pooled attention |
+
+**Forward pass returns:** `(logits, binary_logit)` where logits is `(B, 5)` and binary_logit is `(B, 1)`.
+
+**Parameter groups** (for differential learning rates):
+```python
+groups = model.get_param_groups(backbone_lr=2e-5, head_lr=5e-4)
+# group[0]: wav2vec2 backbone (unfrozen layers) at backbone_lr
+# group[1]: classifier heads + fusion layers at head_lr
+```
+
+---
+
+### 6.2. TemporalBiLSTMClassifier (Frozen Features - 2.07M params)
 
 **File:** `Models/model_temporal_bilstm.py`
 **Architecture choice:** `--arch temporal_bilstm`
 
-The strongest model. Combines BiLSTM sequential modeling with dilated CNNs for multi-scale temporal patterns and multi-head attention pooling with per-class specialization.
+The strongest frozen-feature model. Combines BiLSTM sequential modeling with dilated CNNs for multi-scale temporal patterns and multi-head attention pooling with per-class specialization.
 
 **Constructor:**
 ```python
@@ -343,7 +437,7 @@ Input: (B, 768, T)
 
 ---
 
-### 6.2. TemporalStutterClassifier (870K params)
+### 6.3. TemporalStutterClassifier (870K params)
 
 **File:** `Models/model_temporal_w2v.py`
 **Architecture choice:** `--arch temporal_w2v`
@@ -376,7 +470,7 @@ TemporalStutterClassifier(input_dim=768, n_classes=5, hidden_dim=256, dropout=0.
 
 ---
 
-### 6.3. CNNBiLSTM (Baseline)
+### 6.4. CNNBiLSTM (Baseline)
 
 **File:** `Models/model_cnn_bilstm.py`
 **Architecture choice:** `--arch cnn_bilstm`
@@ -406,7 +500,7 @@ CNNBiLSTM(in_channels=123, cnn_out=128, lstm_hidden=256, n_classes=5, num_layers
 
 ---
 
-### 6.4. ImprovedStutteringCNN
+### 6.5. ImprovedStutteringCNN
 
 **File:** `Models/model_improved_90plus.py`
 **Architecture choice:** `--arch improved_90plus`
@@ -438,7 +532,7 @@ ImprovedStutteringCNN(n_channels=123, n_classes=5, dropout=0.4)
 
 ---
 
-### 6.5. ImprovedStutteringCNNLarge
+### 6.6. ImprovedStutteringCNNLarge
 
 **File:** `Models/model_improved_90plus_large.py`
 **Architecture choice:** `--arch improved_90plus_large`
@@ -478,7 +572,7 @@ ImprovedStutteringCNNLarge(n_channels=123, n_classes=5, dropout=0.35, d_model=25
 
 ---
 
-### 6.6. ImprovedStutteringCNNLargeSE
+### 6.7. ImprovedStutteringCNNLargeSE
 
 **File:** `Models/model_improved_90plus_se.py`
 **Architecture choice:** `--arch improved_90plus_se`
@@ -509,9 +603,72 @@ ImprovedStutteringCNNLargeSE(n_channels=123, n_classes=5, dropout=0.35)
 
 ## 7. Training System
 
+### 7.1. End-to-End Fine-Tuning (Production)
+
+**File:** `Models/train_w2v_finetune.py` (~1049 lines)
+
+Hierarchical training with binary detection as PRIMARY task and 5-class classification as SECONDARY.
+
+**Key classes:**
+- `RawAudioDataset` - Loads raw WAV files, applies label cleaning + majority vote, returns `(audio_tensor, labels_5class, binary_label)`
+- `FineTuneTrainer` - Full training loop with hierarchical loss, binary threshold optimization, EMA
+- `ExponentialMovingAverage` - EMA of model weights with configurable decay
+- `MetricsTracker` - Tracks all binary + multi-class metrics per epoch
+
+**Hierarchical Loss:**
+```python
+total_loss = binary_weight * loss_binary + multiclass_weight * loss_multiclass
+# Defaults: binary_weight=1.0, multiclass_weight=0.5
+# Model selection uses BINARY F1 for checkpointing (not multi-class)
+```
+
+**Binary threshold optimization:** Grid search over [0.20, 0.80] step 0.05 every validation epoch to find optimal binary decision threshold.
+
+**Data augmentation (raw audio):**
+- Speed perturbation (0.9x - 1.1x)
+- Time masking (zero out random segments)
+- Polarity inversion (random sign flip)
+- Additive Gaussian noise
+- MixUp at batch level (configurable alpha)
+
+**Optimized training config:**
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Backbone LR | 2e-5 | For unfrozen wav2vec2 layers |
+| Head LR | 5e-4 | For classifier heads |
+| Batch size | 24 | Optimized for i7-1165G7 CPU |
+| Accumulate | 1 | Effective batch = 24 |
+| Freeze layers | 12 | Bottom 12 of 24 transformer layers |
+| Max audio length | 48000 | 3 seconds at 16kHz |
+| MixUp alpha | 0.3 | Beta distribution parameter |
+| R-Drop | 0 | Disabled (doubles compute) |
+| binary-weight | 1.0 | PRIMARY task |
+| multiclass-weight | 0.5 | SECONDARY task |
+| OMP threads | 6 | Optimal for 4-core/8-thread CPU |
+| num_workers | 0 | Windows spawn overhead makes >0 slower |
+
+**CLI (key arguments):**
+```
+--backbone-lr       2e-5        wav2vec2 backbone learning rate
+--head-lr           5e-4        Classifier head learning rate
+--freeze-layers     12          Number of transformer layers to freeze
+--max-audio-len     48000       Max audio samples (truncate longer)
+--binary-weight     1.0         Binary loss weight (PRIMARY)
+--multiclass-weight 0.5         Multiclass loss weight (SECONDARY)
+--mixup-alpha       0.3         MixUp alpha (0 = disabled)
+--rdrop-weight      0           R-Drop regularization weight
+--use-ema           True        Exponential Moving Average
+--ema-decay         0.999       EMA decay factor
+```
+
+---
+
+### 7.2. Frozen-Feature Training
+
 **File:** `Models/train_90plus_final.py` (~2039 lines)
 
-### 7.1. Data Loading & Augmentation
+### 7.3. Data Loading & Augmentation
 
 **`AudioDataset` class** - Supports 3 data formats:
 
@@ -550,7 +707,7 @@ mixed_x = lam * x + (1 - lam) * x[idx]
 mixed_y = lam * y + (1 - lam) * y[idx]
 ```
 
-### 7.2. Loss Functions
+### 7.4. Loss Functions
 
 **`FocalLoss`** (default, from `Models/utils.py`):
 ```
@@ -569,7 +726,7 @@ loss = BCE(logits, smoothed_target)
 
 **`BCEWithLogitsLoss`:** Standard binary cross-entropy with optional `pos_weight`.
 
-### 7.3. Optimizers & Schedulers
+### 7.5. Optimizers & Schedulers
 
 **Optimizer:** AdamW
 
@@ -589,7 +746,7 @@ loss = BCE(logits, smoothed_target)
 
 **LR Warmup:** For `reduce` scheduler, manual linear warmup over 3 epochs from 1% -> 100% of target LR.
 
-### 7.4. Training Techniques
+### 7.6. Training Techniques
 
 | Technique | Implementation | CLI Flag |
 |-----------|---------------|----------|
@@ -643,7 +800,7 @@ pos_weight[c] = clamp(neg_count[c] / pos_count[c], min=1.0, max=50.0)
 }
 ```
 
-### 7.5. All CLI Arguments
+### 7.7. All CLI Arguments (Frozen-Feature Training)
 
 ```
 Training Arguments:
@@ -713,7 +870,31 @@ System:
 
 ---
 
-## 8. Calibration & Evaluation
+## 8. Production Inference
+
+**File:** `Models/detect.py` (290 lines)
+
+Production-ready detection pipeline for single files, directories, or long audio segments. Uses the trained Wav2VecFineTuneClassifier checkpoint for hierarchical detection.
+
+**Key features:**
+- Loads model checkpoint, applies optimal binary threshold
+- Sliding window inference for long audio (configurable window/stride)
+- Outputs JSON with per-segment and per-type probabilities
+- Supports batch processing of directories
+- CLI interface:
+
+```sh
+python Models/detect.py --audio input.wav --output results.json
+python Models/detect.py --audio_dir my_wavs/ --output_dir results/
+```
+
+**Output:**
+- For each audio file: binary stutter detection, per-type probabilities, segment-level results for long files
+- JSON format for easy downstream use
+
+---
+
+## 9. Calibration & Evaluation
 
 ### Threshold Calibration
 
@@ -763,7 +944,7 @@ Loads checkpoint + val data, computes:
 
 ---
 
-## 9. Self-Training Label Refinement
+## 10. Self-Training Label Refinement
 
 **File:** `Models/self_train_refine.py`
 
@@ -797,7 +978,7 @@ Reports per-class flip statistics (how many labels were changed in each directio
 
 ---
 
-## 10. Ensemble Evaluation with TTA
+## 11. Ensemble Evaluation with TTA
 
 **File:** `Models/ensemble_eval.py`
 
@@ -838,7 +1019,7 @@ Grid search on [0.1, 0.9] step 0.01 to maximize F1 per class.
 
 ---
 
-## 11. Stutter Repair
+## 12. Stutter Repair
 
 **File:** `Models/repair_advanced.py` (725 lines)
 **Class:** `AdvancedStutterRepair`
@@ -853,7 +1034,7 @@ Falls back to SciPy-only processing when librosa is unavailable.
 
 ---
 
-## 12. Pipeline Scripts
+## 13. Pipeline Scripts
 
 ### Main Pipeline: `scripts/run_90plus_pipeline.ps1` (345 lines)
 
@@ -917,6 +1098,49 @@ conda activate agni311
 .\scripts\run_90plus_pipeline.ps1
 ```
 
+### Production Fine-Tuning Pipeline: `scripts/run_finetune_pipeline.ps1` (168 lines)
+
+End-to-end pipeline for hierarchical detection system (wav2vec2-large fine-tuning):
+
+```
+STEP 1: Launches training with all optimized settings for CPU (see table below)
+STEP 2: Monitors system resources, sets High Performance power plan
+STEP 3: Handles all CLI arguments, environment variables, and logging
+STEP 4: Runs `Models/train_w2v_finetune.py` with correct config
+```
+
+**Pipeline Hyperparameters:**
+```
+Model: Wav2VecFineTuneClassifier
+Backbone LR: 2e-5
+Head LR: 5e-4
+Batch size: 24
+Accumulate: 1
+Freeze layers: 12
+Max audio len: 48000
+MixUp alpha: 0.3
+R-Drop: 0
+binary-weight: 1.0
+multiclass-weight: 0.5
+OMP threads: 6
+num_workers: 0
+Early stopping: 25
+```
+
+**CPU Optimization (set in pipeline):**
+```powershell
+$env:OMP_NUM_THREADS = "6"
+$env:MKL_NUM_THREADS = "6"
+powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High Performance
+```
+
+**Usage:**
+```powershell
+cd D:\Bunny\AGNI
+conda activate agni311
+.\scripts\run_finetune_pipeline.ps1
+```
+
 ### Other Pipeline Scripts
 
 | Script | Description |
@@ -940,7 +1164,7 @@ conda activate agni311
 
 ---
 
-## 13. Tools & Utilities
+## 14. Tools & Utilities
 
 All in `tools/`:
 
@@ -987,7 +1211,7 @@ All in `tools/`:
 
 ---
 
-## 14. Tests
+## 15. Tests
 
 All in `tests/`:
 
@@ -1035,7 +1259,7 @@ python -m pytest tests/ -v
 
 ---
 
-## 15. Constants & Configuration
+## 16. Constants & Configuration
 
 **File:** `Models/constants.py`
 
@@ -1058,7 +1282,7 @@ python -m pytest tests/ -v
 
 ---
 
-## 16. Directory Structure
+## 17. Directory Structure
 
 ```
 D:\Bunny\AGNI\
@@ -1098,6 +1322,9 @@ D:\Bunny\AGNI\
 |   |-- extract_wav2vec2_temporal.py   # wav2vec2 temporal feature extraction
 |   |
 |   |-- # --- Model Architectures ---
+|   |-- model_w2v_finetune.py           # Wav2Vec2-large fine-tuning model (production)
+|   |-- train_w2v_finetune.py           # Hierarchical training system (production)
+|   |-- detect.py                       # Production inference pipeline
 |   |-- model_temporal_bilstm.py       # TemporalBiLSTMClassifier (2.07M, primary)
 |   |-- model_temporal_w2v.py          # TemporalStutterClassifier (870K)
 |   |-- model_cnn_bilstm.py            # CNNBiLSTM (baseline)
@@ -1274,10 +1501,38 @@ Solution: The extraction script skips existing `.npz` files. Delete `datasets/fe
 
 ---
 
+## 19. Other Issues
+
+**PowerShell parsing error with parentheses in double-quoted strings:**
+```
+"(90+ F1)" is interpreted as a PowerShell expression
+```
+Solution: Use single quotes for any string containing parentheses or plus signs in PowerShell scripts.
+
+**OMP thread/env mismatch:**
+```
+OMP_NUM_THREADS=8, --omp-threads=6
+```
+Solution: Always set both to the same value (6 is optimal for i7-1165G7 4c/8t).
+
+**R-Drop doubles compute:**
+Solution: Set `--rdrop-weight 0` to disable for 50% speedup on CPU.
+
+**num_workers > 0 is slower on Windows:**
+Solution: Use `--num-workers 0` for best CPU performance (Windows spawn overhead).
+
+**Label noise / low F1:**
+Solution: Use majority vote (≥2 annotators) and remove all Unsure/PoorAudio/NoSpeech/Music labels for cleanest training set.
+
+**Training is CPU-bound at 95%:**
+Solution: No config can fix this; only faster CPU will help. RAM is not the bottleneck.
+
+---
+
 ## License
 
 Internal research project.
 
 ---
 
-*Last updated: March 2, 2026*
+*Last updated: March 3, 2026*

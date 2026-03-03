@@ -33,11 +33,11 @@ $ErrorActionPreference = "Stop"
 conda activate agni311
 
 # ---- System Optimization: Max out CPU threads ----
-$env:OMP_NUM_THREADS = "8"
-$env:MKL_NUM_THREADS = "8"
-$env:NUMEXPR_MAX_THREADS = "8"
-$env:OPENBLAS_NUM_THREADS = "8"
-$env:VECLIB_MAXIMUM_THREADS = "8"
+$env:OMP_NUM_THREADS = "6"       # 6 threads = sweet spot (135 samp/s vs 111 at 8)
+$env:MKL_NUM_THREADS = "6"
+$env:NUMEXPR_MAX_THREADS = "6"
+$env:OPENBLAS_NUM_THREADS = "6"
+$env:VECLIB_MAXIMUM_THREADS = "6"
 # High Performance power plan (already set, kept as fallback)
 powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
@@ -45,7 +45,7 @@ Write-Host ""
 Write-Host "=============================================================" -ForegroundColor Cyan
 Write-Host "   ULTIMATE 90+ STUTTERING DETECTION PIPELINE"                -ForegroundColor Cyan
 Write-Host "   Ensemble + Self-Training + TTA"                            -ForegroundColor Cyan
-Write-Host "   CPU Optimized: 8 threads, batch 128"                       -ForegroundColor Cyan
+Write-Host "   CPU Optimized: 6 threads, LR=1e-4, EMA+SWA"               -ForegroundColor Cyan
 Write-Host "=============================================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -64,21 +64,22 @@ $LayerMode     = "weighted-avg"
 # Training (shared across all runs)
 $Arch          = "temporal_bilstm"
 $Epochs        = 100
-$Batch         = 128        # Increased: 40GB RAM can handle 128 easily
-$LR            = "3e-4"
+$Batch         = 256        # 40GB RAM: even 1024 leaves 20GB free
+$LR            = "1e-4"     # Reduced from 3e-4 to prevent collapse
 $Dropout       = 0.3
-$WeightDecay   = "5e-4"
-$Scheduler     = "cosine"
+$WeightDecay   = "1e-4"     # Reduced from 5e-4 for stability
+$Scheduler     = "reduce"   # ReduceLROnPlateau adapts to progress
 $FocalGamma    = 2.0
-$MixupAlpha    = 0.2
-$SWAStart      = 60
+$MixupAlpha    = 0.1        # Reduced from 0.2 - lighter regularization
+$SWAStart      = 30         # Start averaging earlier for stability
 $SWALR         = "1e-5"
-$EarlyStop     = 25
-$GradClip      = 1.0
+$EarlyStop     = 15         # Don't waste time on collapse
+$GradClip      = 0.5        # Tighter clipping prevents gradient explosions
 $Oversample    = "rare"
 $LabelSmoothing = 0.05
-$NumWorkers    = 4          # Increased: 4 cores can prefetch efficiently
-$ExtractWorkers = 8        # Use all 8 logical CPUs for extraction
+$NumWorkers    = 0          # 0 is fastest: SSD + small NPZ + Windows spawn overhead
+$ExtractWorkers = 8         # Use all 8 logical CPUs for extraction
+$UseEMA        = $true      # EMA smooths weight updates
 
 # ==========================================================================
 # STEP 1: Extract multi-layer temporal features
@@ -133,29 +134,36 @@ Write-Host "  STEP 2/6: Stage 1 Training (seed 42)" -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
 Write-Host ""
 
-python Models/train_90plus_final.py `
-    --data-dir          $DataDir `
-    --arch              $Arch `
-    --epochs            $Epochs `
-    --batch-size        $Batch `
-    --lr                $LR `
-    --dropout           $Dropout `
-    --weight-decay      $WeightDecay `
-    --scheduler         $Scheduler `
-    --focal-gamma       $FocalGamma `
-    --mixup-alpha       $MixupAlpha `
-    --use-swa `
-    --swa-start         $SWAStart `
-    --swa-lr            $SWALR `
-    --early-stop        $EarlyStop `
-    --grad-clip         $GradClip `
-    --oversample        $Oversample `
-    --sampler-replacement `
-    --save-thresholds `
-    --use-label-smoothing `
-    --label-smoothing   $LabelSmoothing `
-    --num-workers       $NumWorkers `
-    --seed              42
+$trainArgs = @(
+    '--data-dir',          $DataDir,
+    '--arch',              $Arch,
+    '--epochs',            $Epochs,
+    '--batch-size',        $Batch,
+    '--lr',                $LR,
+    '--dropout',           $Dropout,
+    '--weight-decay',      $WeightDecay,
+    '--scheduler',         $Scheduler,
+    '--focal-gamma',       $FocalGamma,
+    '--mixup-alpha',       $MixupAlpha,
+    '--use-swa',
+    '--swa-start',         $SWAStart,
+    '--swa-lr',            $SWALR,
+    '--early-stop',        $EarlyStop,
+    '--grad-clip',         $GradClip,
+    '--oversample',        $Oversample,
+    '--sampler-replacement',
+    '--save-thresholds',
+    '--use-label-smoothing',
+    '--label-smoothing',   $LabelSmoothing,
+    '--num-workers',       $NumWorkers,
+    '--omp-threads',       6,
+    '--sched-patience',    7
+)
+if ($UseEMA) {
+    $trainArgs += @('--use-ema', '--ema-decay', '0.999')
+}
+
+python Models/train_90plus_final.py @trainArgs --seed 42
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "WARNING: Stage 1 training returned non-zero exit code." -ForegroundColor Yellow
@@ -204,29 +212,7 @@ Write-Host "  STEP 4/6: Stage 2 Training (refined)"  -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
 Write-Host ""
 
-python Models/train_90plus_final.py `
-    --data-dir          $RefinedDir `
-    --arch              $Arch `
-    --epochs            $Epochs `
-    --batch-size        $Batch `
-    --lr                $LR `
-    --dropout           $Dropout `
-    --weight-decay      $WeightDecay `
-    --scheduler         $Scheduler `
-    --focal-gamma       $FocalGamma `
-    --mixup-alpha       $MixupAlpha `
-    --use-swa `
-    --swa-start         $SWAStart `
-    --swa-lr            $SWALR `
-    --early-stop        $EarlyStop `
-    --grad-clip         $GradClip `
-    --oversample        $Oversample `
-    --sampler-replacement `
-    --save-thresholds `
-    --use-label-smoothing `
-    --label-smoothing   $LabelSmoothing `
-    --num-workers       $NumWorkers `
-    --seed              42
+python Models/train_90plus_final.py @trainArgs --data-dir $RefinedDir --seed 42
 
 # ==========================================================================
 # STEP 5: Train 2 more models (seeds 123, 777) for ensemble
@@ -240,29 +226,7 @@ Write-Host ""
 foreach ($seed in @(123, 777)) {
     Write-Host "  Training with seed $seed ..." -ForegroundColor Cyan
 
-    python Models/train_90plus_final.py `
-        --data-dir          $RefinedDir `
-        --arch              $Arch `
-        --epochs            $Epochs `
-        --batch-size        $Batch `
-        --lr                $LR `
-        --dropout           $Dropout `
-        --weight-decay      $WeightDecay `
-        --scheduler         $Scheduler `
-        --focal-gamma       $FocalGamma `
-        --mixup-alpha       $MixupAlpha `
-        --use-swa `
-        --swa-start         $SWAStart `
-        --swa-lr            $SWALR `
-        --early-stop        $EarlyStop `
-        --grad-clip         $GradClip `
-        --oversample        $Oversample `
-        --sampler-replacement `
-        --save-thresholds `
-        --use-label-smoothing `
-        --label-smoothing   $LabelSmoothing `
-        --num-workers       $NumWorkers `
-        --seed              $seed
+    python Models/train_90plus_final.py @trainArgs --data-dir $RefinedDir --seed $seed
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "WARNING: Seed $seed training returned non-zero." -ForegroundColor Yellow
